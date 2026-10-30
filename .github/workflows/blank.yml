@@ -15,19 +15,19 @@ jobs:
   download-and-split:
     runs-on: ubuntu-latest
     steps:
-      - name: Install dependencies
+      - name: Install dependencies & curl-cffi for Cloudflare bypass
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg python3-pip
-          pip install -U yt-dlp beautifulsoup4 requests
+          # התקנת yt-dlp יחד עם curl-cffi לעקיפת הגנות Cloudflare
+          pip install -U "yt-dlp[default,curl-cffi]" curl-cffi beautifulsoup4
 
-      - name: Find and Download Audio from Now14
+      - name: Fetch from Now14 and Download
         run: |
           python3 - << 'EOF'
-          import urllib.request
+          from curl_cffi import requests
           import re
           import subprocess
           import sys
-          import os
 
           custom_url = "${{ github.event.inputs.custom_url }}".strip()
           target_url = ""
@@ -36,38 +36,42 @@ jobs:
               target_url = custom_url
               print(f"משתמש בקישור שהוזן: {target_url}")
           else:
-              print("מחפש את הפרק האחרון של הפטריוטים באתר עכשיו 14...")
-              req = urllib.request.Request(
-                  "https://www.now14.co.il/programs/the-patriots/",
-                  headers={'User-Agent': 'Mozilla/5.0'}
-              )
+              print("מתחבר לאתר עכשיו 14 עם עקיפת Cloudflare (curl_cffi)...")
               try:
-                  html = urllib.request.urlopen(req).read().decode('utf-8')
-                  # חיפוש קישורים לפרקים מלאים של הפטריוטים
-                  matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']*פטריוטים[^"\']*)["\']', html)
-                  if not matches:
-                      matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']+)["\']', html)
-                      matches = [m for m in matches if 'patriot' in m or 'תוכנית' in m]
+                  # שימוש ב-curl_cffi להזדהות כדפדפן Chrome 120 אמיתי
+                  s = requests.Session(impersonate="chrome120")
+                  response = s.get("https://www.now14.co.il/programs/the-patriots/")
+                  
+                  if response.status_code == 200:
+                      print("התחברות לאתר עברה בהצלחה (Cloudflare עוקף)!")
+                      html = response.text
+                      matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']*פטריוטים[^"\']*)["\']', html)
+                      if not matches:
+                          matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']+)["\']', html)
+                          matches = [m for m in matches if 'patriot' in m or 'תוכנית' in m]
 
-                  if matches:
-                      target_url = matches[0]
-                      print(f"נמצא פרק: {target_url}")
+                      if matches:
+                          target_url = matches[0]
+                          print(f"נמצא פרק: {target_url}")
+                      else:
+                          target_url = "https://www.now14.co.il/programs/the-patriots/"
                   else:
-                      print("לא נמצא קישור אוטומטי, משתמש בעמוד הראשי של הפטריוטים")
+                      print(f"סטטוס תשובה: {response.status_code}")
                       target_url = "https://www.now14.co.il/programs/the-patriots/"
               except Exception as e:
-                  print(f"שגיאה באיתור: {e}")
+                  print(f"שגיאה: {e}")
                   target_url = "https://www.now14.co.il/programs/the-patriots/"
 
-          # הורדה עם yt-dlp ישירות משרתי ערוץ 14
+          # הורדה באמצעות yt-dlp תוך התחזות ל-Chrome
           cmd = [
               "yt-dlp",
+              "--impersonate", "chrome",
               "-x",
               "--audio-format", "mp3",
               "-o", "episode.mp3",
               target_url
           ]
-          print("מפעיל הורדה...")
+          print(f"מוריד מ- {target_url}...")
           res = subprocess.run(cmd)
           if res.returncode != 0:
               sys.exit(res.returncode)
@@ -85,4 +89,4 @@ jobs:
           TAG="patriotim-$(date +'%Y%m%d-%H%M%S')"
           gh release create "$TAG" chunk_*.dat \
             --title "הפטריוטים $(date +'%d/%m/%Y %H:%M')" \
-            --notes "קבצי שמע מפוצלים מאתר ערוץ 14"
+            --notes "קבצי שמע מפוצלים"
