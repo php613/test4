@@ -1,10 +1,10 @@
-name: Download Latest Patriotim (Now14)
+name: Download Latest Patriotim (Cloudflare WARP)
 
 on:
   workflow_dispatch:
     inputs:
       custom_url:
-        description: 'קישור ספציפי (השאר ריק למשיכת הפרק האחרון מאתר ערוץ 14)'
+        description: 'קישור ספציפי (השאר ריק להורדה אוטומטית של הפרק האחרון)'
         required: false
         default: ''
 
@@ -15,67 +15,53 @@ jobs:
   download-and-split:
     runs-on: ubuntu-latest
     steps:
-      - name: Install dependencies & curl-cffi for Cloudflare bypass
+      - name: Install FFmpeg, Cloudflare WARP & Deno
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg python3-pip
-          # התקנת yt-dlp יחד עם curl-cffi לעקיפת הגנות Cloudflare
-          pip install -U "yt-dlp[default,curl-cffi]" curl-cffi beautifulsoup4
+          # 1. הוספת המאגר הרשמי והתקנת Cloudflare WARP
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          
+          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp
+          
+          # 2. הפעלת Cloudflare WARP במצב פרוקסי מקומי (פורט 40000)
+          sudo systemctl enable --now warp-svc
+          sleep 2
+          warp-cli --accept-tos registration new || true
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+          sleep 4
+          
+          # בדיקה שחיבור ה-WARP פעיל
+          curl -x socks5h://127.0.0.1:40000 -s https://www.cloudflare.com/cdn-cgi/trace | grep warp
 
-      - name: Fetch from Now14 and Download
+          # 3. התקנת Deno עבור פענוח של יוטיוב
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Start BotGuard Token Server & Install yt-dlp
         run: |
-          python3 - << 'EOF'
-          from curl_cffi import requests
-          import re
-          import subprocess
-          import sys
+          # הפעלת שרת מקומי שמייצר אסימון "אני לא בוט" עבור יוטיוב
+          docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          
+          # התקנת yt-dlp עם תמיכת התחזות לדפדפן כרום (עוקף Cloudflare 403) ותוסף ה-PO Token
+          pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
 
-          custom_url = "${{ github.event.inputs.custom_url }}".strip()
-          target_url = ""
-
-          if custom_url:
-              target_url = custom_url
-              print(f"משתמש בקישור שהוזן: {target_url}")
-          else:
-              print("מתחבר לאתר עכשיו 14 עם עקיפת Cloudflare (curl_cffi)...")
-              try:
-                  # שימוש ב-curl_cffi להזדהות כדפדפן Chrome 120 אמיתי
-                  s = requests.Session(impersonate="chrome120")
-                  response = s.get("https://www.now14.co.il/programs/the-patriots/")
-                  
-                  if response.status_code == 200:
-                      print("התחברות לאתר עברה בהצלחה (Cloudflare עוקף)!")
-                      html = response.text
-                      matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']*פטריוטים[^"\']*)["\']', html)
-                      if not matches:
-                          matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']+)["\']', html)
-                          matches = [m for m in matches if 'patriot' in m or 'תוכנית' in m]
-
-                      if matches:
-                          target_url = matches[0]
-                          print(f"נמצא פרק: {target_url}")
-                      else:
-                          target_url = "https://www.now14.co.il/programs/the-patriots/"
-                  else:
-                      print(f"סטטוס תשובה: {response.status_code}")
-                      target_url = "https://www.now14.co.il/programs/the-patriots/"
-              except Exception as e:
-                  print(f"שגיאה: {e}")
-                  target_url = "https://www.now14.co.il/programs/the-patriots/"
-
-          # הורדה באמצעות yt-dlp תוך התחזות ל-Chrome
-          cmd = [
-              "yt-dlp",
-              "--impersonate", "chrome",
-              "-x",
-              "--audio-format", "mp3",
-              "-o", "episode.mp3",
-              target_url
-          ]
-          print(f"מוריד מ- {target_url}...")
-          res = subprocess.run(cmd)
-          if res.returncode != 0:
-              sys.exit(res.returncode)
-          EOF
+      - name: Download Audio
+        run: |
+          if [ -n "${{ github.event.inputs.custom_url }}" ]; then
+            TARGET_URL="${{ github.event.inputs.custom_url }}"
+          else
+            TARGET_URL="ytsearch1:עכשיו 14 הפטריוטים התוכנית המלאה"
+          fi
+          
+          echo "מוריד מ: $TARGET_URL"
+          
+          yt-dlp \
+            --proxy "socks5://127.0.0.1:40000" \
+            --extractor-args "generic:impersonate" \
+            -x --audio-format mp3 \
+            -o "episode.mp3" \
+            "$TARGET_URL"
 
       - name: Split audio into .dat chunks
         run: |
