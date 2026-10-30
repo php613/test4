@@ -1,10 +1,10 @@
-name: Download Latest Patriotim Automatically
+name: Download Latest Patriotim (Now14)
 
 on:
   workflow_dispatch:
     inputs:
       custom_url:
-        description: 'קישור ספציפי (השאר ריק להורדה אוטומטית של הפרק האחרון)'
+        description: 'קישור ספציפי (השאר ריק למשיכת הפרק האחרון מאתר ערוץ 14)'
         required: false
         default: ''
 
@@ -17,28 +17,61 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
-          pip install -U yt-dlp
-          # התקנת deno לפענוח JavaScript מיוטיוב
-          curl -fsSL https://deno.land/install.sh | sh
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          sudo apt-get update && sudo apt-get install -y ffmpeg python3-pip
+          pip install -U yt-dlp beautifulsoup4 requests
 
-      - name: Download Audio
+      - name: Find and Download Audio from Now14
         run: |
-          if [ -n "${{ github.event.inputs.custom_url }}" ]; then
-            TARGET_URL="${{ github.event.inputs.custom_url }}"
-          else
-            TARGET_URL="ytsearch1:עכשיו 14 הפטריוטים התוכנית המלאה"
-          fi
-          
-          echo "מוריד מ: $TARGET_URL"
-          
-          # שימוש בלקוח Android ו-iOS כדי לעקוף את חסימת הבוטים של יוטיוב
-          yt-dlp \
-            --extractor-args "youtube:player_client=android,ios" \
-            -x --audio-format mp3 \
-            -o "episode.mp3" \
-            "$TARGET_URL"
+          python3 - << 'EOF'
+          import urllib.request
+          import re
+          import subprocess
+          import sys
+          import os
+
+          custom_url = "${{ github.event.inputs.custom_url }}".strip()
+          target_url = ""
+
+          if custom_url:
+              target_url = custom_url
+              print(f"משתמש בקישור שהוזן: {target_url}")
+          else:
+              print("מחפש את הפרק האחרון של הפטריוטים באתר עכשיו 14...")
+              req = urllib.request.Request(
+                  "https://www.now14.co.il/programs/the-patriots/",
+                  headers={'User-Agent': 'Mozilla/5.0'}
+              )
+              try:
+                  html = urllib.request.urlopen(req).read().decode('utf-8')
+                  # חיפוש קישורים לפרקים מלאים של הפטריוטים
+                  matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']*פטריוטים[^"\']*)["\']', html)
+                  if not matches:
+                      matches = re.findall(r'href=["\'](https://www.now14.co.il/[^"\']+)["\']', html)
+                      matches = [m for m in matches if 'patriot' in m or 'תוכנית' in m]
+
+                  if matches:
+                      target_url = matches[0]
+                      print(f"נמצא פרק: {target_url}")
+                  else:
+                      print("לא נמצא קישור אוטומטי, משתמש בעמוד הראשי של הפטריוטים")
+                      target_url = "https://www.now14.co.il/programs/the-patriots/"
+              except Exception as e:
+                  print(f"שגיאה באיתור: {e}")
+                  target_url = "https://www.now14.co.il/programs/the-patriots/"
+
+          # הורדה עם yt-dlp ישירות משרתי ערוץ 14
+          cmd = [
+              "yt-dlp",
+              "-x",
+              "--audio-format", "mp3",
+              "-o", "episode.mp3",
+              target_url
+          ]
+          print("מפעיל הורדה...")
+          res = subprocess.run(cmd)
+          if res.returncode != 0:
+              sys.exit(res.returncode)
+          EOF
 
       - name: Split audio into .dat chunks
         run: |
@@ -52,4 +85,4 @@ jobs:
           TAG="patriotim-$(date +'%Y%m%d-%H%M%S')"
           gh release create "$TAG" chunk_*.dat \
             --title "הפטריוטים $(date +'%d/%m/%Y %H:%M')" \
-            --notes "קבצי שמע מפוצלים"
+            --notes "קבצי שמע מפוצלים מאתר ערוץ 14"
