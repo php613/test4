@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       custom_url:
-        description: 'קישור ספציפי (השאר ריק כדי להוריד אוטומטית את הפרק האחרון)'
+        description: 'קישור ספציפי (השאר ריק להורדה אוטומטית של הפרק האחרון)'
         required: false
         default: ''
 
@@ -19,22 +19,29 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
           pip install -U yt-dlp
+          # התקנת deno לפענוח JavaScript מיוטיוב
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
-      - name: Download Audio (Auto or by URL)
+      - name: Download Audio
         run: |
           if [ -n "${{ github.event.inputs.custom_url }}" ]; then
             TARGET_URL="${{ github.event.inputs.custom_url }}"
           else
-            # חיפוש אוטומטי של הפרק המלא האחרון מערוץ 14
             TARGET_URL="ytsearch1:עכשיו 14 הפטריוטים התוכנית המלאה"
           fi
           
           echo "מוריד מ: $TARGET_URL"
-          yt-dlp -x --audio-format mp3 -o "episode.mp3" "$TARGET_URL"
+          
+          # שימוש בלקוח Android ו-iOS כדי לעקוף את חסימת הבוטים של יוטיוב
+          yt-dlp \
+            --extractor-args "youtube:player_client=android,ios" \
+            -x --audio-format mp3 \
+            -o "episode.mp3" \
+            "$TARGET_URL"
 
       - name: Split audio into .dat chunks
         run: |
-          # פיצול לקבצים של 20MB עם סיומת .dat כדי לעקוף את הסינון
           split -b 20M -d --additional-suffix=.dat episode.mp3 chunk_
           ls -lh chunk_*.dat
 
