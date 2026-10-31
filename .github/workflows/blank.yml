@@ -1,62 +1,87 @@
-name: Download Weekly Patriotim (Video to ZIP DAT)
+name: Download Weekly Patriotim (Cached, Multi-threaded & Split 2GB)
 
 on:
   workflow_dispatch:
     inputs:
       quality:
-        description: 'איכות וידאו (מומלץ 480p כדי לא לעבור את מגבלת 2GB של גיטהאב)'
+        description: 'איכות וידאו (בזכות הפיצול ל-2GB ניתן לבחור גם 720 או 1080)'
         required: true
-        default: '480'
+        default: '720'
         type: choice
         options:
-          - '360'
           - '480'
           - '720'
+          - '1080'
 
 permissions:
   contents: write
 
 jobs:
-  download-and-pack:
+  download-pack-split:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Tools (FFmpeg, Cloudflare WARP, Deno, Zip)
+      # 1. קאש עבור חבילות PIP (חוסך זמן התקנה של yt-dlp ו-curl-cffi)
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-ytdlp-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # 2. קאש עבור Deno
+      - name: Cache Deno
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.deno
+            ~/.cache/deno
+          key: ${{ runner.os }}-deno-v1
+
+      # 3. התקנת כלים והרצת שירותים במקביל
+      - name: Setup Tools & Services
         run: |
+          # התקנת מאגר Cloudflare
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          
+
           sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp zip
-          
+
+          # הרמת שירות ה-BotGuard ב-Docker ברקע
+          docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+
+          # הפעלת WARP
           sudo systemctl enable --now warp-svc
           sleep 2
           warp-cli --accept-tos registration new || true
           warp-cli --accept-tos mode proxy
           warp-cli --accept-tos connect
-          sleep 4
-          
-          curl -x socks5h://127.0.0.1:40000 -s https://www.cloudflare.com/cdn-cgi/trace | grep warp
+          sleep 3
 
-          curl -fsSL https://deno.land/install.sh | sh
+          # התקנת Deno במידה ולא נטען מהקאש
+          if ! command -v deno &> /dev/null; then
+            curl -fsSL https://deno.land/install.sh | sh
+          fi
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
-      - name: Start BotGuard Token Server & Install yt-dlp
-        run: |
-          docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          # התקנת yt-dlp (מהירה מאוד בזכות ה-Cache)
           pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
 
-      - name: Download Full Weekly Videos
+      # 4. הורדה מואצת עם 8 מקטעים במקביל (-N 8)
+      - name: Download Full Weekly Videos (Multi-threaded)
         run: |
           mkdir -p downloads
           HEIGHT="${{ github.event.inputs.quality }}"
           
-          echo "מחפש ומוריד את כל תוכניות הפטריוטים המלאות מ-7 הימים האחרונים באיכות ${HEIGHT}p..."
+          echo "מוריד את תוכניות הפטריוטים מהשבוע האחרון באיכות ${HEIGHT}p עם הורדה מקבילית..."
           
           yt-dlp \
             --proxy "socks5://127.0.0.1:40000" \
             --extractor-args "generic:impersonate" \
+            -N 8 \
             --playlist-end 150 \
             --dateafter now-7days \
             --match-filter "duration > 2400 & title *= 'הפטריוטים' & title *= 'המלאה' & !is_live" \
@@ -64,27 +89,34 @@ jobs:
             --merge-output-format mp4 \
             -o "downloads/%(upload_date)s - %(title)s.%(ext)s" \
             "https://www.youtube.com/@c14news/videos"
-            
-          echo "רשימת הקבצים שהורדו:"
+
           ls -lh downloads/
 
-      - name: Compress to ZIP and Rename to .dat
+      # 5. דחיסה מהירה ל-ZIP ומחיקת תיקיית המקור (חוסך מקום בדיסק)
+      - name: Package to ZIP
         run: |
-          echo "אורז את תיקיית הסרטונים לקובץ ZIP..."
-          # שימוש בדגל -0 מאחסן ישירות ללא דחיסה מיותרת של וידאו וחוסך דקות ארוכות
+          echo "אורז את הסרטונים ל-ZIP במצב אחסון מהיר..."
           zip -0 -r patriotim_week.zip downloads/
-          
-          echo "משנה סיומת ל-dat..."
-          mv patriotim_week.zip patriotim_week.dat
-          
-          echo "גודל הקובץ הסופי שנוצר:"
-          ls -lh patriotim_week.dat
+          # מחיקת הוידאו הגולמי כדי לפנות מקום לפיצול
+          rm -rf downloads/
 
-      - name: Upload to GitHub Release
+      # 6. פיצול לנתחים של 1950MB (כדי לעמוד במגבלת 2GB של גיטהאב) עם סיומת dat
+      - name: Split ZIP into 2GB DAT parts
+        run: |
+          echo "מפצל את קובץ ה-ZIP לנתחים של עד 1950MB..."
+          split -b 1950M -d --additional-suffix=.dat patriotim_week.zip patriotim_part_
+          # מחיקת קובץ ה-ZIP המקורי כדי שלא יועלה כפול
+          rm -f patriotim_week.zip
+          
+          echo "קבצי ה-DAT שנוצרו להעלאה:"
+          ls -lh patriotim_part_*.dat
+
+      # 7. העלאת כל חלקי ה-DAT ל-Release
+      - name: Upload DAT parts to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="patriotim-week-$(date +'%Y%m%d-%H%M%S')"
-          gh release create "$TAG" patriotim_week.dat \
-            --title "הפטריוטים - כל פרקי השבוע ($(date +'%d/%m/%Y'))" \
-            --notes "קובץ dat יחיד ומלא (ארכיון ZIP שסיומתו שונתה) המכיל את כל פרקי השבוע האחרון."
+          gh release create "$TAG" patriotim_part_*.dat \
+            --title "הפטריוטים - פרקי השבוע (${{ github.event.inputs.quality }}p) - $(date +'%d/%m/%Y')" \
+            --notes "קבצי DAT מפוצלים עד 2GB (ארכיון ZIP שפוצל). להסבר על איחוד הקבצים ראה את פקודת ה-copy/cat."
