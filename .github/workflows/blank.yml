@@ -24,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-release-patriotim-v2
+          key: ${{ runner.os }}-pip-release-patriotim-v3
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -67,7 +67,6 @@ jobs:
             COOKIE_ARGS="--cookies cookies.txt"
           fi
 
-          # בדיקה האם הוזן קישור ישיר או שיש לסרוק את הערוץ
           if [[ "$QUERY" =~ ^https?:// ]]; then
             echo "🎯 זוהה קישור ישיר: $QUERY"
             yt-dlp \
@@ -81,7 +80,7 @@ jobs:
               --windows-filenames \
               -x --audio-format mp3 --audio-quality 0 \
               -o "downloads/%(title).100s.%(ext)s" \
-              "$QUERY"
+              "$QUERY" || true
           else
             echo "📺 סורק את ההעלאות האחרונות בערוץ 14 לאיתור הפרק המלא האחרון..."
             yt-dlp \
@@ -98,17 +97,18 @@ jobs:
               --match-filter "title *= 'הפטריוטים' & duration > 2400" \
               -x --audio-format mp3 --audio-quality 0 \
               -o "downloads/%(title).100s.%(ext)s" \
-              "https://www.youtube.com/@c14news/videos"
+              "https://www.youtube.com/@c14news/videos" || true
           fi
 
-          # איתור הקובץ שירד ושינוי הסיומת ל-.dat
+          # בדיקה שאכן ירד קובץ שמע
           ORIG_FILE=$(find downloads -type f \( -name "*.mp3" -o -name "*.m4a" -o -name "*.opus" \) | head -n 1)
 
           if [ -z "$ORIG_FILE" ]; then
-            echo "❌ לא נמצא קובץ שמע מתאים (ודא ששודר פרק מלא בימים האחרונים)."
+            echo "❌ לא נמצא קובץ שמע מתאים בתיקייה."
             exit 1
           fi
 
+          # שינוי סיומת הקובץ ל-.dat
           DAT_FILE="${ORIG_FILE%.*}.dat"
           mv "$ORIG_FILE" "$DAT_FILE"
           echo "✅ הקובץ הומר בהצלחה לשם: $DAT_FILE"
