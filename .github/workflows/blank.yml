@@ -1,28 +1,38 @@
-name: Paged Search Downloader (ZIP to 2GB DAT)
+name: Search, Preview & Smart Downloader
 
 on:
   workflow_dispatch:
     inputs:
       search_query:
-        description: 'טקסט חופשי לחיפוש (או קישור ישיר)'
+        description: 'טקסט לחיפוש (או קישור ישיר לסרטון ספציפי/פלייליסט)'
         required: true
         type: string
+      action_mode:
+        description: 'פעולה מבוקשת'
+        required: true
+        default: 'download'
+        type: choice
+        options:
+          - 'download'     # הורדת הסרטונים
+          - 'list_only'    # הצגת שמות וקישורים בלבד תוך שניות (בלי להוריד וידאו)
       start_index:
-        description: 'מאיזו תוצאה להתחיל? (1 לסבב ראשון, 6 לסבב שני וכו)'
+        description: 'מאיזו תוצאה להתחיל?'
         required: true
         default: '1'
         type: string
       count:
-        description: 'כמה תוצאות להוריד בסבב הזה?'
+        description: 'כמה תוצאות לסרוק/להוריד?'
         required: true
         default: '5'
         type: string
       quality:
-        description: 'איכות וידאו מקסימלית'
+        description: 'איכות וידאו (לבדיקה מהירה מומלץ 240p/360p, להורדה איכותית 1080p)'
         required: true
-        default: '720'
+        default: '240'
         type: choice
         options:
+          - '240'
+          - '360'
           - '480'
           - '720'
           - '1080'
@@ -31,13 +41,12 @@ permissions:
   contents: write
 
 jobs:
-  download-pack-split:
+  process-videos:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. קאש עבור חבילות PIP
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -46,7 +55,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 2. קאש עבור Deno
       - name: Cache Deno
         uses: actions/cache@v4
         with:
@@ -55,7 +63,6 @@ jobs:
             ~/.cache/deno
           key: ${{ runner.os }}-deno-v1
 
-      # 3. התקנת כלים והרמת שירותים במקביל
       - name: Setup Tools & Services
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -79,8 +86,43 @@ jobs:
 
           pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
 
-      # 4. חיפוש מדורג לפי טווח תוצאות
-      - name: Download Videos with Pagination
+      # הפקת טבלת שמות וקישורים (לוקח שניות בודדות)
+      - name: Fetch Metadata & Titles Table
+        env:
+          QUERY: ${{ github.event.inputs.search_query }}
+          START: ${{ github.event.inputs.start_index }}
+          COUNT: ${{ github.event.inputs.count }}
+        run: |
+          END=$(( START + COUNT - 1 ))
+          
+          if [[ "$QUERY" =~ ^https?:// ]]; then
+            TARGET_URL="$QUERY"
+          else
+            TARGET_URL="ytsearch${END}:${QUERY}"
+          fi
+
+          echo "סורק שמות וכותרות מ-$START עד $END..."
+          
+          echo "### תוצאות סריקה עבור: \`$QUERY\`" > summary.md
+          echo "**טווח תוצאות:** $START עד $END" >> summary.md
+          echo "" >> summary.md
+          echo "| מס׳ | כותרת הסרטון | משך זמן | קישור ישיר |" >> summary.md
+          echo "| :--- | :--- | :--- | :--- |" >> summary.md
+
+          yt-dlp \
+            --proxy "socks5://127.0.0.1:40000" \
+            --extractor-args "generic:impersonate" \
+            --playlist-items "${START}:${END}" \
+            --flat-playlist \
+            --print "| %(playlist_index)s | %(title)s | %(duration_string)s | [צפייה / העתקת קישור](%(webpage_url)s) |" \
+            "$TARGET_URL" >> summary.md
+
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+          cat summary.md
+
+      # הורדת הוידאו (מתבצע רק אם לא נבחר מצב list_only)
+      - name: Download Videos
+        if: ${{ github.event.inputs.action_mode == 'download' }}
         env:
           QUERY: ${{ github.event.inputs.search_query }}
           START: ${{ github.event.inputs.start_index }}
@@ -88,10 +130,7 @@ jobs:
           HEIGHT: ${{ github.event.inputs.quality }}
         run: |
           mkdir -p downloads
-
-          # חישוב אינדקס הסיום
           END=$(( START + COUNT - 1 ))
-          echo "מוריד תוצאות מ-$START עד $END עבור החיפוש: '$QUERY' באיכות ${HEIGHT}p..."
 
           if [[ "$QUERY" =~ ^https?:// ]]; then
             TARGET_URL="$QUERY"
@@ -99,44 +138,49 @@ jobs:
             TARGET_URL="ytsearch${END}:${QUERY}"
           fi
 
+          echo "מוריד באיכות ${HEIGHT}p..."
+          
           yt-dlp \
             --proxy "socks5://127.0.0.1:40000" \
             --extractor-args "generic:impersonate" \
             -N 8 \
             --playlist-items "${START}:${END}" \
             --windows-filenames \
-            -f "bestvideo[height<=${HEIGHT}]+bestaudio/best[height<=${HEIGHT}]/best" \
+            -f "bestvideo[height<=${HEIGHT}]+bestaudio/best[height<=${HEIGHT}]/worst" \
             --merge-output-format mp4 \
             -o "downloads/%(playlist_index)02d - %(title).100s.%(ext)s" \
             "$TARGET_URL"
 
-          echo "הסרטונים שהורדו בסבב הנוכחי:"
-          ls -lh downloads/
-
-      # 5. דחיסה מהירה ל-ZIP ומחיקת תיקיית הוידאו
-      - name: Package to ZIP
+      # כיווץ מקסימלי (zip -9) ופיצול
+      - name: Maximum Compression & Split
+        if: ${{ github.event.inputs.action_mode == 'download' }}
         run: |
-          echo "אורז את הסרטונים ל-ZIP במצב אחסון מהיר..."
-          zip -0 -r search_results.zip downloads/
+          echo "דוחס ברמה מקסימלית (zip -9)..."
+          zip -9 -r search_results.zip downloads/
           rm -rf downloads/
 
-      # 6. פיצול לנתחי 1950MB עם סיומת dat
-      - name: Split ZIP into 2GB DAT parts
-        run: |
+          echo "מפצל לנתחי 1950MB עם סיומת dat..."
           split -b 1950M -d --additional-suffix=.dat search_results.zip search_part_
           rm -f search_results.zip
-          ls -lh search_part_*.dat
 
-      # 7. העלאה ל-Release
-      - name: Upload DAT parts to GitHub Release
+      # העלאה ל-Release (רשימה בלבד או עם קבצי ה-dat)
+      - name: Publish to GitHub Release
         env:
           QUERY: ${{ github.event.inputs.search_query }}
           START: ${{ github.event.inputs.start_index }}
           COUNT: ${{ github.event.inputs.count }}
+          MODE: ${{ github.event.inputs.action_mode }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           END=$(( START + COUNT - 1 ))
           TAG="search-$(date +'%Y%m%d-%H%M%S')"
-          gh release create "$TAG" search_part_*.dat \
-            --title "תוצאות חיפוש: $QUERY (תוצאות $START-$END)" \
-            --notes "קובץ ZIP מפוצל המכיל את תוצאות $START עד $END עבור החיפוש: '$QUERY'."
+
+          if [ "$MODE" = "list_only" ]; then
+            gh release create "$TAG" \
+              --title "📋 רשימת כותרות: $QUERY ($START-$END)" \
+              --notes-file summary.md
+          else
+            gh release create "$TAG" search_part_*.dat \
+              --title "📦 תוצאות חיפוש: $QUERY ($START-$END)" \
+              --notes-file summary.md
+          fi
