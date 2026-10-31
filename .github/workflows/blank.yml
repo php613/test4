@@ -1,4 +1,4 @@
-name: High Quality YouTube to Google Drive (Smart & Sync)
+name: High Quality YouTube to Google Drive (Stable & Fast)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       count:
         description: 'כמה סרטונים להוריד ולהעלות?'
         required: true
-        default: '3'
+        default: '5'
         type: string
       quality:
         description: 'איכות וידאו מקסימלית'
@@ -33,36 +33,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. קאש עבור חבילות PIP
+      # 1. קאש עבור חבילות PIP לחסכון בזמן
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-gdrive-v3
+          key: ${{ runner.os }}-pip-gdrive-stable-v1
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 2. קאש עבור Deno
-      - name: Cache Deno
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.deno
-            ~/.cache/deno
-          key: ${{ runner.os }}-deno-v1
-
-      # 3. התקנת כלים, שירותים וספריות
-      - name: Setup Tools & Services
+      # 2. התקנת כלים, רשת וספריות Google
+      - name: Setup Tools & Cloudflare WARP
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
           sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp
 
-          # הרמת BotGuard ב-Docker
-          docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
-
-          # הפעלת WARP
           sudo systemctl enable --now warp-svc
           sleep 2
           warp-cli --accept-tos registration new || true
@@ -70,21 +57,15 @@ jobs:
           warp-cli --accept-tos connect
           sleep 3
 
-          if ! command -v deno &> /dev/null; then
-            curl -fsSL https://deno.land/install.sh | sh
-          fi
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+          pip install -U "yt-dlp[default,curl-cffi]" google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-          pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider google-api-python-client google-auth-httplib2 google-auth-oauthlib
-
-      # 4. הכנת סקריפטים (העלאה לדרייב + סנכרון קבצים קיימים)
-      - name: Prepare Scripts
+      # 3. הכנת סקריפט העלאה של סרטון יחיד ברקע
+      - name: Prepare Upload Script
         env:
           GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
         run: |
           echo "$GDRIVE_SA_KEY" > sa_key.json
 
-          # סקריפט העלאה של סרטון יחיד ברקע ומחיקתו מהשרת מיד בסיום
           cat << 'EOF' > upload_single.py
           import os
           import sys
@@ -126,13 +107,14 @@ jobs:
 
           print(f"✅ [דרייב] הושלם בהצלחה: '{filename}'! מזהה: {response.get('id')}", flush=True)
 
+          # מחיקת הקובץ מהשרת מיד בסיום ההעלאה
           try:
               os.remove(filepath)
           except:
               pass
           EOF
 
-      # 5. בדיקת קבצים קיימים בדרייב ומניעת הורדה חוזרת
+      # 4. בדיקת קבצים קיימים בדרייב ומניעת הורדה כפולה
       - name: Sync Existing Drive Files
         env:
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -147,13 +129,13 @@ jobs:
 
           folder_id = os.environ.get('FOLDER_ID')
           query = os.environ.get('QUERY')
-          count = os.environ.get('COUNT', '1')
+          count = os.environ.get('COUNT', '5')
 
           SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
           creds = service_account.Credentials.from_service_account_file('sa_key.json', scopes=SCOPES)
           service = build('drive', 'v3', credentials=creds)
 
-          # שליפת שמות כל הקבצים שקיימים כבר בתיקיית הדרייב
+          # שליפת רשימת הקבצים שכבר קיימים בדרייב
           existing_files = set()
           page_token = None
           while True:
@@ -172,16 +154,16 @@ jobs:
           print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בתיקיית הדרייב.")
 
           if query.startswith('http://') or query.startswith('https://'):
-              target = query
+            target = query
           else:
-              target = f"ytsearch{count}:{query}"
+            target = f"ytsearch{count}:{query}"
 
-          # שליפת שמות הסרטונים מיוטיוב ללא הורדה
+          # שליפת מזהי הסרטונים ללא הורדה
           cmd = [
               "yt-dlp",
               "--proxy", "socks5://127.0.0.1:40000",
               "--extractor-args", "generic:impersonate",
-              "--extractor-args", "youtube:player_client=web,android",
+              "--extractor-args", "youtube:player_client=android,ios,mweb",
               "--flat-playlist",
               "--print", "%(id)s\t%(title)s",
               target
@@ -197,7 +179,7 @@ jobs:
                       v_id, v_title = line.split('\t', 1)
                       v_clean = v_title.strip().lower()
                       
-                      # אם שם הסרטון מופיע בקובץ שכבר נמצא בדרייב - רושמים בארכיון כדי לדלג
+                      # אם הקובץ כבר קיים בדרייב - רושמים בארכיון כדי לדלג עליו
                       is_present = False
                       for ex in existing_files:
                           if ex in v_clean or v_clean in ex or v_id in ex:
@@ -208,10 +190,10 @@ jobs:
                           print(f"⏩ קיים כבר בדרייב (ידלג מראש): {v_title.strip()} ({v_id})")
                           archive.write(f"youtube {v_id}\n")
           except Exception as e:
-              print(f"הערה: סריקה מקדימה דילגה על בדיקה ({e})")
+              print(f"סריקה מקדימה דילגה על בדיקה: {e}")
           EOF
 
-      # 6. הורדה והעלאה שוטפת במקביל עם מנגנון Timeout וסבב שני
+      # 5. הורדה והעלאה יציבה וללא שגיאות טוקנים
       - name: Download and Stream to Google Drive
         env:
           QUERY: ${{ github.event.inputs.search_query }}
@@ -227,7 +209,6 @@ jobs:
             TARGET_URL="ytsearch${COUNT}:${QUERY}"
           fi
 
-          # הגדרת עד 2 סבבי ריצה (הסבב השני ירוץ רק אם היו סרטונים שנכשלו/נתקעו)
           MAX_ATTEMPTS=2
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
             echo "=================================================="
@@ -237,7 +218,7 @@ jobs:
             yt-dlp \
               --proxy "socks5://127.0.0.1:40000" \
               --extractor-args "generic:impersonate" \
-              --extractor-args "youtube:player_client=web,android" \
+              --extractor-args "youtube:player_client=android,ios,mweb" \
               -N 8 \
               --socket-timeout 20 \
               --retries 3 \
@@ -256,7 +237,6 @@ jobs:
             echo "ממתין לסיום ההעלאות בסבב $attempt..."
             wait || true
 
-            # בדיקה האם הושלמו כל הסרטונים
             SUCCESS_COUNT=$(wc -l < archive.txt 2>/dev/null || echo 0)
             echo "עד כה טופלו בהצלחה: $SUCCESS_COUNT סרטונים."
             if [ "$SUCCESS_COUNT" -ge "$COUNT" ]; then
