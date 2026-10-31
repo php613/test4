@@ -1,10 +1,19 @@
-name: Download Weekly Patriotim (Cached, Multi-threaded & Split 2GB)
+name: Download Videos by Search Query (ZIP to 2GB DAT)
 
 on:
   workflow_dispatch:
     inputs:
+      search_query:
+        description: 'טקסט חופשי לחיפוש ביוטיוב (או קישור ישיר לערוץ / פלייליסט)'
+        required: true
+        type: string
+      max_results:
+        description: 'כמות סרטונים מקסימלית להורדה'
+        required: true
+        default: '5'
+        type: string
       quality:
-        description: 'איכות וידאו (בזכות הפיצול ל-2GB ניתן לבחור גם 720 או 1080)'
+        description: 'איכות וידאו מקסימלית'
         required: true
         default: '720'
         type: choice
@@ -23,7 +32,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. קאש עבור חבילות PIP (חוסך זמן התקנה של yt-dlp ו-curl-cffi)
+      # 1. קאש עבור חבילות PIP
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
@@ -41,16 +50,15 @@ jobs:
             ~/.cache/deno
           key: ${{ runner.os }}-deno-v1
 
-      # 3. התקנת כלים והרצת שירותים במקביל
+      # 3. התקנת כלים והרמת שירותים במקביל
       - name: Setup Tools & Services
         run: |
-          # התקנת מאגר Cloudflare
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
           sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp zip
 
-          # הרמת שירות ה-BotGuard ב-Docker ברקע
+          # הרמת BotGuard ב-Docker
           docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
 
           # הפעלת WARP
@@ -67,56 +75,64 @@ jobs:
           fi
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
-          # התקנת yt-dlp (מהירה מאוד בזכות ה-Cache)
           pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
 
-      # 4. הורדה מואצת עם 8 מקטעים במקביל (-N 8)
-      - name: Download Full Weekly Videos (Multi-threaded)
+      # 4. חיפוש חופשי והורדה מואצת
+      - name: Download Videos by Search
+        env:
+          QUERY: ${{ github.event.inputs.search_query }}
+          MAX: ${{ github.event.inputs.max_results }}
+          HEIGHT: ${{ github.event.inputs.quality }}
         run: |
           mkdir -p downloads
-          HEIGHT="${{ github.event.inputs.quality }}"
           
-          echo "מוריד את תוכניות הפטריוטים מהשבוע האחרון באיכות ${HEIGHT}p עם הורדה מקבילית..."
+          # אם הוזן קישור ישיר - מורידים ממנו, אחרת מבצעים חיפוש חופשי ביוטיוב
+          if [[ "$QUERY" =~ ^https?:// ]]; then
+            TARGET_URL="$QUERY"
+          else
+            TARGET_URL="ytsearch${MAX}:${QUERY}"
+          fi
+
+          echo "מחפש ומוריד עד $MAX סרטונים עבור: '$QUERY' באיכות ${HEIGHT}p..."
           
           yt-dlp \
             --proxy "socks5://127.0.0.1:40000" \
             --extractor-args "generic:impersonate" \
             -N 8 \
-            --playlist-end 150 \
-            --dateafter now-7days \
-            --match-filter "duration > 2400 & title *= 'הפטריוטים' & title *= 'המלאה' & !is_live" \
+            --max-downloads "$MAX" \
+            --windows-filenames \
             -f "bestvideo[height<=${HEIGHT}]+bestaudio/best[height<=${HEIGHT}]/best" \
             --merge-output-format mp4 \
-            -o "downloads/%(upload_date)s - %(title)s.%(ext)s" \
-            "https://www.youtube.com/@c14news/videos"
+            -o "downloads/%(autonumber)02d - %(title).100s.%(ext)s" \
+            "$TARGET_URL"
 
+          echo "הסרטונים שהורדו בהצלחה:"
           ls -lh downloads/
 
-      # 5. דחיסה מהירה ל-ZIP ומחיקת תיקיית המקור (חוסך מקום בדיסק)
+      # 5. דחיסה מהירה ל-ZIP ומחיקת תיקיית הוידאו
       - name: Package to ZIP
         run: |
-          echo "אורז את הסרטונים ל-ZIP במצב אחסון מהיר..."
-          zip -0 -r patriotim_week.zip downloads/
-          # מחיקת הוידאו הגולמי כדי לפנות מקום לפיצול
+          echo "אורז את כל הסרטונים ל-ZIP במצב אחסון מהיר..."
+          zip -0 -r search_results.zip downloads/
           rm -rf downloads/
 
-      # 6. פיצול לנתחים של 1950MB (כדי לעמוד במגבלת 2GB של גיטהאב) עם סיומת dat
+      # 6. פיצול לנתחי 1950MB עם סיומת dat
       - name: Split ZIP into 2GB DAT parts
         run: |
-          echo "מפצל את קובץ ה-ZIP לנתחים של עד 1950MB..."
-          split -b 1950M -d --additional-suffix=.dat patriotim_week.zip patriotim_part_
-          # מחיקת קובץ ה-ZIP המקורי כדי שלא יועלה כפול
-          rm -f patriotim_week.zip
+          echo "מפצל את ה-ZIP לחלקים של עד 1950MB..."
+          split -b 1950M -d --additional-suffix=.dat search_results.zip search_part_
+          rm -f search_results.zip
           
-          echo "קבצי ה-DAT שנוצרו להעלאה:"
-          ls -lh patriotim_part_*.dat
+          echo "רשימת הקבצים המוכנים להעלאה:"
+          ls -lh search_part_*.dat
 
-      # 7. העלאת כל חלקי ה-DAT ל-Release
+      # 7. העלאה ל-Release
       - name: Upload DAT parts to GitHub Release
         env:
+          QUERY: ${{ github.event.inputs.search_query }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="patriotim-week-$(date +'%Y%m%d-%H%M%S')"
-          gh release create "$TAG" patriotim_part_*.dat \
-            --title "הפטריוטים - פרקי השבוע (${{ github.event.inputs.quality }}p) - $(date +'%d/%m/%Y')" \
-            --notes "קבצי DAT מפוצלים עד 2GB (ארכיון ZIP שפוצל). להסבר על איחוד הקבצים ראה את פקודת ה-copy/cat."
+          TAG="search-$(date +'%Y%m%d-%H%M%S')"
+          gh release create "$TAG" search_part_*.dat \
+            --title "תוצאות חיפוש: $QUERY ($(date +'%d/%m/%Y %H:%M'))" \
+            --notes "קבצי DAT מפוצלים עד 2GB המכילים את תוצאות החיפוש עבור '$QUERY'."
