@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-gdrive-stable-v1
+          key: ${{ runner.os }}-pip-gdrive-stable-v2
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -80,7 +80,7 @@ jobs:
           if not os.path.isfile(filepath):
               sys.exit(0)
 
-          folder_id = os.environ.get('FOLDER_ID')
+          folder_id = os.environ.get('FOLDER_ID', '').strip()
           sa_key_path = 'sa_key.json'
           filename = os.path.basename(filepath)
           filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
@@ -97,7 +97,7 @@ jobs:
           }
 
           media = MediaFileUpload(filepath, resumable=True, chunksize=10*1024*1024)
-          request = service.files().create(body=file_metadata, media_body=media, fields='id')
+          request = service.files().create(body=file_metadata, media_body=media, fields='id', supportsAllDrives=True)
 
           response = None
           while response is None:
@@ -114,7 +114,7 @@ jobs:
               pass
           EOF
 
-      # 4. בדיקת קבצים קיימים בדרייב ומניעת הורדה כפולה
+      # 4. בדיקת קבצים קיימים בדרייב (כולל תמיכה מלאה בתיקיות משותפות)
       - name: Sync Existing Drive Files
         env:
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -127,36 +127,67 @@ jobs:
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
 
-          folder_id = os.environ.get('FOLDER_ID')
-          query = os.environ.get('QUERY')
-          count = os.environ.get('COUNT', '5')
+          folder_id = os.environ.get('FOLDER_ID', '').strip()
+          query = os.environ.get('QUERY', '').strip()
+          count = os.environ.get('COUNT', '5').strip()
 
-          SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+          SCOPES = ['https://www.googleapis.com/auth/drive']
           creds = service_account.Credentials.from_service_account_file('sa_key.json', scopes=SCOPES)
           service = build('drive', 'v3', credentials=creds)
 
-          # שליפת רשימת הקבצים שכבר קיימים בדרייב
           existing_files = set()
+
+          # ניסיון 1: שליפה מתוך התיקייה ישירות עם תמיכה בכל סוגי הדרייב
           page_token = None
           while True:
-              resp = service.files().list(
-                  q=f"'{folder_id}' in parents and trashed = false",
-                  fields="nextPageToken, files(name)",
-                  pageToken=page_token
-              ).execute()
-              for f in resp.get('files', []):
-                  base = os.path.splitext(f['name'])[0].strip().lower()
-                  existing_files.add(base)
-              page_token = resp.get('nextPageToken')
-              if not page_token:
+              try:
+                  resp = service.files().list(
+                      q=f"'{folder_id}' in parents and trashed = false",
+                      pageSize=1000,
+                      supportsAllDrives=True,
+                      includeItemsFromAllDrives=True,
+                      fields="nextPageToken, files(id, name)",
+                      pageToken=page_token
+                  ).execute()
+                  for f in resp.get('files', []):
+                      base = os.path.splitext(f['name'])[0].strip().lower()
+                      existing_files.add(base)
+                  page_token = resp.get('nextPageToken')
+                  if not page_token:
+                      break
+              except Exception as e:
+                  print(f"הערת סריקה 1: {e}")
                   break
 
-          print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בתיקיית הדרייב.")
+          # ניסיון 2 (רשת ביטחון): אם לא אותרו קבצים בחיפוש לפי תיקייה, נסרוק את כל הקבצים ששותפו עם חשבון השירות
+          if len(existing_files) == 0:
+              page_token = None
+              while True:
+                  try:
+                      resp = service.files().list(
+                          q="trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+                          pageSize=1000,
+                          supportsAllDrives=True,
+                          includeItemsFromAllDrives=True,
+                          fields="nextPageToken, files(id, name)",
+                          pageToken=page_token
+                      ).execute()
+                      for f in resp.get('files', []):
+                          base = os.path.splitext(f['name'])[0].strip().lower()
+                          existing_files.add(base)
+                      page_token = resp.get('nextPageToken')
+                      if not page_token:
+                          break
+                  except Exception as e:
+                      print(f"הערת סריקה 2: {e}")
+                      break
+
+          print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בתיקיית הדרייב.", flush=True)
 
           if query.startswith('http://') or query.startswith('https://'):
-            target = query
+              target = query
           else:
-            target = f"ytsearch{count}:{query}"
+              target = f"ytsearch{count}:{query}"
 
           # שליפת מזהי הסרטונים ללא הורדה
           cmd = [
@@ -182,7 +213,7 @@ jobs:
                       # אם הקובץ כבר קיים בדרייב - רושמים בארכיון כדי לדלג עליו
                       is_present = False
                       for ex in existing_files:
-                          if ex in v_clean or v_clean in ex or v_id in ex:
+                          if len(ex) > 3 and (ex in v_clean or v_clean in ex) or (v_id and v_id in ex):
                               is_present = True
                               break
                       
