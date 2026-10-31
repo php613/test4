@@ -4,12 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       search_query:
-        description: 'טקסט לחיפוש או קישור ישיר לסרטון'
-        required: true
-        default: 'עכשיו 14 הפטריוטים התוכנית המלאה'
+        description: 'קישור ישיר לסרטון (השאר ריק או "הפטריוטים" להורדת הפרק האחרון מערוץ 14)'
+        required: false
+        default: 'הפטריוטים'
         type: string
 
-# הרשאה נדרשת עבור העלאת קבצים ל-Releases של המאגר
 permissions:
   contents: write
 
@@ -25,7 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-release-patriotim-v1
+          key: ${{ runner.os }}-pip-release-patriotim-v2
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -56,8 +55,8 @@ jobs:
             echo "הוגדרו עוגיות אימות מול יוטיוב."
           fi
 
-      # 4. איתור הפרק המלא האחרון, הורדת השמע והמרה ל-dat
-      - name: Download Latest Audio and Rename to .dat
+      # 4. איתור הפרק המלא האחרון מערוץ 14 והמרה ל-dat
+      - name: Download Latest Episode Audio and Rename to .dat
         env:
           QUERY: ${{ github.event.inputs.search_query }}
         run: |
@@ -68,39 +67,45 @@ jobs:
             COOKIE_ARGS="--cookies cookies.txt"
           fi
 
-          # אם סופק קישור ישיר - מורידים אותו; אחרת, ממיינים לפי תאריך העלאה ומסננים קטעים קצרים
+          # בדיקה האם הוזן קישור ישיר או שיש לסרוק את הערוץ
           if [[ "$QUERY" =~ ^https?:// ]]; then
-            TARGET_URL="$QUERY"
-            FILTER_ARGS=""
+            echo "🎯 זוהה קישור ישיר: $QUERY"
+            yt-dlp \
+              --proxy "socks5://127.0.0.1:40000" \
+              --extractor-args "generic:impersonate" \
+              $COOKIE_ARGS \
+              -N 8 \
+              --socket-timeout 20 \
+              --retries 3 \
+              --fragment-retries 3 \
+              --windows-filenames \
+              -x --audio-format mp3 --audio-quality 0 \
+              -o "downloads/%(title).100s.%(ext)s" \
+              "$QUERY"
           else
-            TARGET_URL="ytsearchdate15:${QUERY}"
-            FILTER_ARGS="--match-filter duration>2400"
+            echo "📺 סורק את ההעלאות האחרונות בערוץ 14 לאיתור הפרק המלא האחרון..."
+            yt-dlp \
+              --proxy "socks5://127.0.0.1:40000" \
+              --extractor-args "generic:impersonate" \
+              $COOKIE_ARGS \
+              -N 8 \
+              --socket-timeout 20 \
+              --retries 3 \
+              --fragment-retries 3 \
+              --windows-filenames \
+              --playlist-end 40 \
+              --max-downloads 1 \
+              --match-filter "title *= 'הפטריוטים' & duration > 2400" \
+              -x --audio-format mp3 --audio-quality 0 \
+              -o "downloads/%(title).100s.%(ext)s" \
+              "https://www.youtube.com/@c14news/videos"
           fi
-
-          echo "🔍 מחפש את התוכנית המלאה העדכנית ביותר..."
-
-          yt-dlp \
-            --proxy "socks5://127.0.0.1:40000" \
-            --extractor-args "generic:impersonate" \
-            $COOKIE_ARGS \
-            -N 8 \
-            --socket-timeout 20 \
-            --retries 3 \
-            --fragment-retries 3 \
-            --windows-filenames \
-            --max-downloads 1 \
-            $FILTER_ARGS \
-            -x \
-            --audio-format mp3 \
-            --audio-quality 0 \
-            -o "downloads/%(title).100s.%(ext)s" \
-            "$TARGET_URL"
 
           # איתור הקובץ שירד ושינוי הסיומת ל-.dat
           ORIG_FILE=$(find downloads -type f \( -name "*.mp3" -o -name "*.m4a" -o -name "*.opus" \) | head -n 1)
 
           if [ -z "$ORIG_FILE" ]; then
-            echo "❌ לא נמצא קובץ שמע מתאים (ייתכן שלא נמצאה תוכנית באורך מעל 40 דק')."
+            echo "❌ לא נמצא קובץ שמע מתאים (ודא ששודר פרק מלא בימים האחרונים)."
             exit 1
           fi
 
@@ -108,7 +113,7 @@ jobs:
           mv "$ORIG_FILE" "$DAT_FILE"
           echo "✅ הקובץ הומר בהצלחה לשם: $DAT_FILE"
 
-      # 5. העלאת הקובץ ל-GitHub Releases
+      # 5. יצירת GitHub Release והעלאת קובץ ה-dat
       - name: Create Release and Upload
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
