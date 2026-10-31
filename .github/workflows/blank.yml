@@ -1,4 +1,4 @@
-name: YouTube Audio to GitHub Releases (.dat)
+name: Latest Patriotim Audio to GitHub Releases (.dat)
 
 on:
   workflow_dispatch:
@@ -6,9 +6,10 @@ on:
       search_query:
         description: 'טקסט לחיפוש או קישור ישיר לסרטון'
         required: true
-        default: 'עכשיו 14 הפטריוטים פרק מלא'
+        default: 'עכשיו 14 הפטריוטים התוכנית המלאה'
         type: string
 
+# הרשאה נדרשת עבור העלאת קבצים ל-Releases של המאגר
 permissions:
   contents: write
 
@@ -19,12 +20,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1. קאש עבור חבילות PIP לחסכון בזמן
+      # 1. קאש עבור חבילות PIP לחסכון בזמן ריצה
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-release-audio-v1
+          key: ${{ runner.os }}-pip-release-patriotim-v1
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -45,7 +46,7 @@ jobs:
 
           pip install -U "yt-dlp[default,curl-cffi]"
 
-      # 3. הכנת עוגיות במידה וקיימות
+      # 3. הכנת עוגיות אימות במידה והוגדרו ב-Secrets
       - name: Prepare Auth Cookies
         env:
           YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
@@ -55,25 +56,29 @@ jobs:
             echo "הוגדרו עוגיות אימות מול יוטיוב."
           fi
 
-      # 4. הורדת שמע והמרה לסיומת dat
-      - name: Download Audio and Rename to .dat
+      # 4. איתור הפרק המלא האחרון, הורדת השמע והמרה ל-dat
+      - name: Download Latest Audio and Rename to .dat
         env:
           QUERY: ${{ github.event.inputs.search_query }}
         run: |
           mkdir -p downloads
-
-          if [[ "$QUERY" =~ ^https?:// ]]; then
-            TARGET_URL="$QUERY"
-          else
-            TARGET_URL="ytsearch1:${QUERY}"
-          fi
 
           COOKIE_ARGS=""
           if [ -f "cookies.txt" ]; then
             COOKIE_ARGS="--cookies cookies.txt"
           fi
 
-          # הורדת השמע הטוב ביותר וחילוץ ל-MP3
+          # אם סופק קישור ישיר - מורידים אותו; אחרת, ממיינים לפי תאריך העלאה ומסננים קטעים קצרים
+          if [[ "$QUERY" =~ ^https?:// ]]; then
+            TARGET_URL="$QUERY"
+            FILTER_ARGS=""
+          else
+            TARGET_URL="ytsearchdate15:${QUERY}"
+            FILTER_ARGS="--match-filter duration>2400"
+          fi
+
+          echo "🔍 מחפש את התוכנית המלאה העדכנית ביותר..."
+
           yt-dlp \
             --proxy "socks5://127.0.0.1:40000" \
             --extractor-args "generic:impersonate" \
@@ -83,6 +88,8 @@ jobs:
             --retries 3 \
             --fragment-retries 3 \
             --windows-filenames \
+            --max-downloads 1 \
+            $FILTER_ARGS \
             -x \
             --audio-format mp3 \
             --audio-quality 0 \
@@ -93,15 +100,15 @@ jobs:
           ORIG_FILE=$(find downloads -type f \( -name "*.mp3" -o -name "*.m4a" -o -name "*.opus" \) | head -n 1)
 
           if [ -z "$ORIG_FILE" ]; then
-            echo "❌ לא נמצא קובץ שמע."
+            echo "❌ לא נמצא קובץ שמע מתאים (ייתכן שלא נמצאה תוכנית באורך מעל 40 דק')."
             exit 1
           fi
 
           DAT_FILE="${ORIG_FILE%.*}.dat"
           mv "$ORIG_FILE" "$DAT_FILE"
-          echo "✅ הקובץ שונה בהצלחה לשם: $DAT_FILE"
+          echo "✅ הקובץ הומר בהצלחה לשם: $DAT_FILE"
 
-      # 5. יצירת GitHub Release והעלאת קובץ ה-dat
+      # 5. העלאת הקובץ ל-GitHub Releases
       - name: Create Release and Upload
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -120,6 +127,6 @@ jobs:
 
           gh release create "$TAG_NAME" "$DAT_FILE" \
             --title "$RELEASE_TITLE" \
-            --notes "קובץ שמע שהורד מיוטיוב בסיומת dat"
+            --notes "קובץ שמע של הפרק המלא האחרון בסיומת dat"
 
           rm -f cookies.txt
