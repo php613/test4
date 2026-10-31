@@ -1,29 +1,34 @@
-name: Download Latest Patriotim (Cloudflare WARP)
+name: Download Weekly Patriotim (Video to ZIP DAT)
 
 on:
   workflow_dispatch:
     inputs:
-      custom_url:
-        description: 'קישור ספציפי (השאר ריק להורדה אוטומטית של הפרק האחרון)'
-        required: false
-        default: ''
+      quality:
+        description: 'איכות וידאו (מומלץ 480p כדי לא לעבור את מגבלת 2GB של גיטהאב)'
+        required: true
+        default: '480'
+        type: choice
+        options:
+          - '360'
+          - '480'
+          - '720'
 
 permissions:
   contents: write
 
 jobs:
-  download-and-split:
+  download-and-pack:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install FFmpeg, Cloudflare WARP & Deno
+      - name: Install Tools (FFmpeg, Cloudflare WARP, Deno, Zip)
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           
-          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp
+          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp zip
           
           sudo systemctl enable --now warp-svc
           sleep 2
@@ -42,33 +47,44 @@ jobs:
           docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
           pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
 
-      - name: Download Audio
+      - name: Download Full Weekly Videos
         run: |
-          if [ -n "${{ github.event.inputs.custom_url }}" ]; then
-            TARGET_URL="${{ github.event.inputs.custom_url }}"
-          else
-            TARGET_URL="ytsearch1:עכשיו 14 הפטריוטים התוכנית המלאה"
-          fi
+          mkdir -p downloads
+          HEIGHT="${{ github.event.inputs.quality }}"
           
-          echo "מוריד מ: $TARGET_URL"
+          echo "מחפש ומוריד את כל תוכניות הפטריוטים המלאות מ-7 הימים האחרונים באיכות ${HEIGHT}p..."
           
           yt-dlp \
             --proxy "socks5://127.0.0.1:40000" \
             --extractor-args "generic:impersonate" \
-            -x --audio-format mp3 \
-            -o "episode.mp3" \
-            "$TARGET_URL"
+            --playlist-end 150 \
+            --dateafter now-7days \
+            --match-filter "duration > 2400 & title *= 'הפטריוטים' & title *= 'המלאה' & !is_live" \
+            -f "bestvideo[height<=${HEIGHT}]+bestaudio/best[height<=${HEIGHT}]/best" \
+            --merge-output-format mp4 \
+            -o "downloads/%(upload_date)s - %(title)s.%(ext)s" \
+            "https://www.youtube.com/@c14news/videos"
+            
+          echo "רשימת הקבצים שהורדו:"
+          ls -lh downloads/
 
-      - name: Split audio into .dat chunks
+      - name: Compress to ZIP and Rename to .dat
         run: |
-          split -b 20M -d --additional-suffix=.dat episode.mp3 chunk_
-          ls -lh chunk_*.dat
+          echo "אורז את תיקיית הסרטונים לקובץ ZIP..."
+          # שימוש בדגל -0 מאחסן ישירות ללא דחיסה מיותרת של וידאו וחוסך דקות ארוכות
+          zip -0 -r patriotim_week.zip downloads/
+          
+          echo "משנה סיומת ל-dat..."
+          mv patriotim_week.zip patriotim_week.dat
+          
+          echo "גודל הקובץ הסופי שנוצר:"
+          ls -lh patriotim_week.dat
 
       - name: Upload to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="patriotim-$(date +'%Y%m%d-%H%M%S')"
-          gh release create "$TAG" chunk_*.dat \
-            --title "הפטריוטים $(date +'%d/%m/%Y %H:%M')" \
-            --notes "קבצי שמע מפוצלים"
+          TAG="patriotim-week-$(date +'%Y%m%d-%H%M%S')"
+          gh release create "$TAG" patriotim_week.dat \
+            --title "הפטריוטים - כל פרקי השבוע ($(date +'%d/%m/%Y'))" \
+            --notes "קובץ dat יחיד ומלא (ארכיון ZIP שסיומתו שונתה) המכיל את כל פרקי השבוע האחרון."
