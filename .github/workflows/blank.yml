@@ -1,60 +1,48 @@
-name: Search, Preview & Smart Downloader
+name: High Quality YouTube to Google Drive (Private & Secure)
 
 on:
   workflow_dispatch:
     inputs:
       search_query:
-        description: 'טקסט לחיפוש (או קישור ישיר לסרטון ספציפי/פלייליסט)'
+        description: 'טקסט לחיפוש או קישור ישיר לסרטון/פלייליסט'
         required: true
         type: string
-      action_mode:
-        description: 'פעולה מבוקשת'
-        required: true
-        default: 'download'
-        type: choice
-        options:
-          - 'download'     # הורדת הסרטונים
-          - 'list_only'    # הצגת שמות וקישורים בלבד תוך שניות (בלי להוריד וידאו)
-      start_index:
-        description: 'מאיזו תוצאה להתחיל?'
+      count:
+        description: 'כמה סרטונים להוריד ולהעלות?'
         required: true
         default: '1'
         type: string
-      count:
-        description: 'כמה תוצאות לסרוק/להוריד?'
-        required: true
-        default: '5'
-        type: string
       quality:
-        description: 'איכות וידאו (לבדיקה מהירה מומלץ 240p/360p, להורדה איכותית 1080p)'
+        description: 'איכות וידאו'
         required: true
-        default: '240'
+        default: '1080'
         type: choice
         options:
-          - '240'
-          - '360'
-          - '480'
           - '720'
           - '1080'
+          - '1440'
+          - '2160'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  process-videos:
+  download-and-upload:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 1. קאש עבור חבילות PIP
       - name: Cache pip packages
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-ytdlp-v1
+          key: ${{ runner.os }}-pip-gdrive-v1
           restore-keys: |
             ${{ runner.os }}-pip-
 
+      # 2. קאש עבור Deno
       - name: Cache Deno
         uses: actions/cache@v4
         with:
@@ -63,12 +51,13 @@ jobs:
             ~/.cache/deno
           key: ${{ runner.os }}-deno-v1
 
+      # 3. התקנת כלים, שירותים וספריות
       - name: Setup Tools & Services
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
-          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp zip
+          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp
 
           docker run --name bgutil-provider -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
 
@@ -84,58 +73,21 @@ jobs:
           fi
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
-          pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
+          pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      # הפקת טבלת שמות וקישורים (לוקח שניות בודדות)
-      - name: Fetch Metadata & Titles Table
+      # 4. הורדת הוידאו
+      - name: Download Videos (High Quality)
         env:
           QUERY: ${{ github.event.inputs.search_query }}
-          START: ${{ github.event.inputs.start_index }}
-          COUNT: ${{ github.event.inputs.count }}
-        run: |
-          END=$(( START + COUNT - 1 ))
-          
-          if [[ "$QUERY" =~ ^https?:// ]]; then
-            TARGET_URL="$QUERY"
-          else
-            TARGET_URL="ytsearch${END}:${QUERY}"
-          fi
-
-          echo "סורק שמות וכותרות מ-$START עד $END..."
-          
-          echo "### תוצאות סריקה עבור: \`$QUERY\`" > summary.md
-          echo "**טווח תוצאות:** $START עד $END" >> summary.md
-          echo "" >> summary.md
-          echo "| מס׳ | כותרת הסרטון | משך זמן | קישור ישיר |" >> summary.md
-          echo "| :--- | :--- | :--- | :--- |" >> summary.md
-
-          yt-dlp \
-            --proxy "socks5://127.0.0.1:40000" \
-            --extractor-args "generic:impersonate" \
-            --playlist-items "${START}:${END}" \
-            --flat-playlist \
-            --print "| %(playlist_index)s | %(title)s | %(duration_string)s | [צפייה / העתקת קישור](%(webpage_url)s) |" \
-            "$TARGET_URL" >> summary.md
-
-          cat summary.md >> $GITHUB_STEP_SUMMARY
-          cat summary.md
-
-      # הורדת הוידאו (מתבצע רק אם לא נבחר מצב list_only)
-      - name: Download Videos
-        if: ${{ github.event.inputs.action_mode == 'download' }}
-        env:
-          QUERY: ${{ github.event.inputs.search_query }}
-          START: ${{ github.event.inputs.start_index }}
           COUNT: ${{ github.event.inputs.count }}
           HEIGHT: ${{ github.event.inputs.quality }}
         run: |
           mkdir -p downloads
-          END=$(( START + COUNT - 1 ))
 
           if [[ "$QUERY" =~ ^https?:// ]]; then
             TARGET_URL="$QUERY"
           else
-            TARGET_URL="ytsearch${END}:${QUERY}"
+            TARGET_URL="ytsearch${COUNT}:${QUERY}"
           fi
 
           echo "מוריד באיכות ${HEIGHT}p..."
@@ -144,43 +96,67 @@ jobs:
             --proxy "socks5://127.0.0.1:40000" \
             --extractor-args "generic:impersonate" \
             -N 8 \
-            --playlist-items "${START}:${END}" \
+            --max-downloads "$COUNT" \
             --windows-filenames \
-            -f "bestvideo[height<=${HEIGHT}]+bestaudio/best[height<=${HEIGHT}]/worst" \
+            -f "bestvideo[height<=${HEIGHT}]+bestaudio/best[height<=${HEIGHT}]/best" \
             --merge-output-format mp4 \
-            -o "downloads/%(playlist_index)02d - %(title).100s.%(ext)s" \
+            -o "downloads/%(title).100s.%(ext)s" \
             "$TARGET_URL"
 
-      # כיווץ מקסימלי (zip -9) ופיצול
-      - name: Maximum Compression & Split
-        if: ${{ github.event.inputs.action_mode == 'download' }}
-        run: |
-          echo "דוחס ברמה מקסימלית (zip -9)..."
-          zip -9 -r search_results.zip downloads/
-          rm -rf downloads/
+          echo "הסרטונים ירדו בהצלחה לשרת."
 
-          echo "מפצל לנתחי 1950MB עם סיומת dat..."
-          split -b 1950M -d --additional-suffix=.dat search_results.zip search_part_
-          rm -f search_results.zip
-
-      # העלאה ל-Release (רשימה בלבד או עם קבצי ה-dat)
-      - name: Publish to GitHub Release
+      # 5. העלאה מאובטחת לדרייב ללא חשיפת פרטים
+      - name: Secure Upload to Google Drive
         env:
-          QUERY: ${{ github.event.inputs.search_query }}
-          START: ${{ github.event.inputs.start_index }}
-          COUNT: ${{ github.event.inputs.count }}
-          MODE: ${{ github.event.inputs.action_mode }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: |
-          END=$(( START + COUNT - 1 ))
-          TAG="search-$(date +'%Y%m%d-%H%M%S')"
+          echo "$GDRIVE_SA_KEY" > sa_key.json
 
-          if [ "$MODE" = "list_only" ]; then
-            gh release create "$TAG" \
-              --title "📋 רשימת כותרות: $QUERY ($START-$END)" \
-              --notes-file summary.md
-          else
-            gh release create "$TAG" search_part_*.dat \
-              --title "📦 תוצאות חיפוש: $QUERY ($START-$END)" \
-              --notes-file summary.md
-          fi
+          python - << 'EOF'
+          import os
+          import sys
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          folder_id = os.environ.get('FOLDER_ID')
+          if not folder_id:
+              print("שגיאה: משתנה GDRIVE_FOLDER_ID אינו מוגדר ב-Secrets!")
+              sys.exit(1)
+
+          sa_key_path = 'sa_key.json'
+          downloads_dir = 'downloads'
+
+          SCOPES = ['https://www.googleapis.com/auth/drive']
+          creds = service_account.Credentials.from_service_account_file(sa_key_path, scopes=SCOPES)
+          service = build('drive', 'v3', credentials=creds)
+
+          files = [f for f in os.listdir(downloads_dir) if os.path.isfile(os.path.join(downloads_dir, f))]
+
+          for filename in sorted(files):
+              filepath = os.path.join(downloads_dir, filename)
+              filesize_mb = os.path.getsize(filepath) / (1024 * 1024)
+              print(f"מעלה לדרייב: {filename} ({filesize_mb:.2f} MB)...")
+
+              file_metadata = {
+                  'name': filename,
+                  'parents': [folder_id]
+              }
+              
+              media = MediaFileUpload(filepath, resumable=True, chunksize=10*1024*1024)
+              request = service.files().create(body=file_metadata, media_body=media, fields='id')
+
+              response = None
+              while response is None:
+                  status, response = request.next_chunk()
+                  if status:
+                      print(f"התקדמות: {int(status.progress() * 100)}%")
+
+              print("הקובץ הועלה בהצלחה לתיקייה המאובטחת!")
+
+          print("\nכל ההעלאות הסתיימו בהצלחה!")
+          EOF
+
+          # מחיקת קובץ המפתח מיד בסיום
+          rm -f sa_key.json
