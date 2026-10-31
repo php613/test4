@@ -1,4 +1,4 @@
-name: High Quality YouTube to Google Drive (Stable & Fast)
+name: High Quality YouTube to Google Drive (Anti-Bot & Sync)
 
 on:
   workflow_dispatch:
@@ -38,11 +38,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-gdrive-stable-v2
+          key: ${{ runner.os }}-pip-gdrive-v4
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 2. התקנת כלים, רשת וספריות Google
+      # 2. התקנת כלים, רשת וספריות
       - name: Setup Tools & Cloudflare WARP
         run: |
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
@@ -59,12 +59,19 @@ jobs:
 
           pip install -U "yt-dlp[default,curl-cffi]" google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-      # 3. הכנת סקריפט העלאה של סרטון יחיד ברקע
-      - name: Prepare Upload Script
+      # 3. הכנת סקריפטים ומפתחות
+      - name: Prepare Scripts & Auth
         env:
           GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
         run: |
           echo "$GDRIVE_SA_KEY" > sa_key.json
+
+          # יצירת קובץ עוגיות רק במידה והוגדר ב-Secrets
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > cookies.txt
+            echo "הוגדרו עוגיות אימות מול יוטיוב."
+          fi
 
           cat << 'EOF' > upload_single.py
           import os
@@ -107,14 +114,13 @@ jobs:
 
           print(f"✅ [דרייב] הושלם בהצלחה: '{filename}'! מזהה: {response.get('id')}", flush=True)
 
-          # מחיקת הקובץ מהשרת מיד בסיום ההעלאה
           try:
               os.remove(filepath)
           except:
               pass
           EOF
 
-      # 4. בדיקת קבצים קיימים בדרייב (כולל תמיכה מלאה בתיקיות משותפות)
+      # 4. בדיקת קבצים קיימים בדרייב ומניעת הורדה כפולה
       - name: Sync Existing Drive Files
         env:
           FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
@@ -137,7 +143,7 @@ jobs:
 
           existing_files = set()
 
-          # ניסיון 1: שליפה מתוך התיקייה ישירות עם תמיכה בכל סוגי הדרייב
+          # ניסיון 1: סריקה ישירה של התיקייה
           page_token = None
           while True:
               try:
@@ -156,10 +162,9 @@ jobs:
                   if not page_token:
                       break
               except Exception as e:
-                  print(f"הערת סריקה 1: {e}")
                   break
 
-          # ניסיון 2 (רשת ביטחון): אם לא אותרו קבצים בחיפוש לפי תיקייה, נסרוק את כל הקבצים ששותפו עם חשבון השירות
+          # ניסיון 2: רשת ביטחון
           if len(existing_files) == 0:
               page_token = None
               while True:
@@ -179,7 +184,6 @@ jobs:
                       if not page_token:
                           break
                   except Exception as e:
-                      print(f"הערת סריקה 2: {e}")
                       break
 
           print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בתיקיית הדרייב.", flush=True)
@@ -189,16 +193,17 @@ jobs:
           else:
               target = f"ytsearch{count}:{query}"
 
-          # שליפת מזהי הסרטונים ללא הורדה
           cmd = [
               "yt-dlp",
               "--proxy", "socks5://127.0.0.1:40000",
               "--extractor-args", "generic:impersonate",
-              "--extractor-args", "youtube:player_client=android,ios,mweb",
               "--flat-playlist",
-              "--print", "%(id)s\t%(title)s",
-              target
+              "--print", "%(id)s\t%(title)s"
           ]
+          if os.path.isfile("cookies.txt"):
+              cmd.extend(["--cookies", "cookies.txt"])
+          cmd.append(target)
+
           try:
               proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
               lines = proc.stdout.strip().split('\n')
@@ -210,7 +215,6 @@ jobs:
                       v_id, v_title = line.split('\t', 1)
                       v_clean = v_title.strip().lower()
                       
-                      # אם הקובץ כבר קיים בדרייב - רושמים בארכיון כדי לדלג עליו
                       is_present = False
                       for ex in existing_files:
                           if len(ex) > 3 and (ex in v_clean or v_clean in ex) or (v_id and v_id in ex):
@@ -224,7 +228,7 @@ jobs:
               print(f"סריקה מקדימה דילגה על בדיקה: {e}")
           EOF
 
-      # 5. הורדה והעלאה יציבה וללא שגיאות טוקנים
+      # 5. הורדה והעלאה עמידה בפני חסימות
       - name: Download and Stream to Google Drive
         env:
           QUERY: ${{ github.event.inputs.search_query }}
@@ -240,6 +244,12 @@ jobs:
             TARGET_URL="ytsearch${COUNT}:${QUERY}"
           fi
 
+          # בדיקה האם יש קובץ עוגיות
+          COOKIE_ARGS=""
+          if [ -f "cookies.txt" ]; then
+            COOKIE_ARGS="--cookies cookies.txt"
+          fi
+
           MAX_ATTEMPTS=2
           for attempt in $(seq 1 $MAX_ATTEMPTS); do
             echo "=================================================="
@@ -249,7 +259,7 @@ jobs:
             yt-dlp \
               --proxy "socks5://127.0.0.1:40000" \
               --extractor-args "generic:impersonate" \
-              --extractor-args "youtube:player_client=android,ios,mweb" \
+              $COOKIE_ARGS \
               -N 8 \
               --socket-timeout 20 \
               --retries 3 \
@@ -277,4 +287,4 @@ jobs:
           done
 
           echo "התהליך הסתיים בהצלחה!"
-          rm -f sa_key.json upload_single.py archive.txt
+          rm -f sa_key.json upload_single.py archive.txt cookies.txt
