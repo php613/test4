@@ -220,7 +220,7 @@ jobs:
               return free / (1024 ** 3)
 
           def upload_worker(worker_id):
-              nonlocal uploaded_count
+              global uploaded_count
               worker_service = build('drive', 'v3', credentials=creds)
               while True:
                   item = upload_queue.get()
