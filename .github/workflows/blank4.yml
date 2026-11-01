@@ -69,7 +69,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-parallel-v6
+          key: ${{ runner.os }}-pip-parallel-v7
           restore-keys: |
             ${{ runner.os }}-pip-
 
@@ -200,38 +200,48 @@ jobs:
           folder_lock = threading.Lock()
 
           def get_or_create_channel_folder(channel_name):
-              sanitized_name = re.sub(r'[\\/*?:"<>|]', "", channel_name).strip() or "Unknown Channel"
+              # הסרת תווים בעייתיים עבור שמות תיקייה ומערכות קבצים (כולל גרש כפול)
+              sanitized_name = re.sub(r'[\\/*?:"<>|\r\n\t]', '', channel_name).strip() or "Unknown Channel"
+              sanitized_name = sanitized_name[:90].strip()
+
               with folder_lock:
                   if sanitized_name in channel_folders_cache:
                       return channel_folders_cache[sanitized_name]
 
-                  query = (f"'{ROOT_FOLDER_ID}' in parents and "
-                           f"name = '{sanitized_name}' and "
-                           f"mimeType = 'application/vnd.google-apps.folder' and "
-                           f"trashed = false")
-                  resp = service.files().list(
-                      q=query,
-                      spaces='drive',
-                      fields='files(id, name)',
-                      supportsAllDrives=True,
-                      includeItemsFromAllDrives=True
-                  ).execute()
-                  files = resp.get('files', [])
+                  try:
+                      # בריחה נכונה של תווים מיוחדים בשאילתת Drive API (גרש בודד ולוכסן)
+                      escaped_query_name = sanitized_name.replace('\\', '\\\\').replace("'", "\\'")
+                      query = (f"'{ROOT_FOLDER_ID}' in parents and "
+                               f"name = '{escaped_query_name}' and "
+                               f"mimeType = 'application/vnd.google-apps.folder' and "
+                               f"trashed = false")
 
-                  if files:
-                      folder_id = files[0]['id']
-                  else:
-                      file_metadata = {
-                          'name': sanitized_name,
-                          'mimeType': 'application/vnd.google-apps.folder',
-                          'parents': [ROOT_FOLDER_ID]
-                      }
-                      folder = service.files().create(body=file_metadata, fields='id', supportsAllDrives=True).execute()
-                      folder_id = folder.get('id')
-                      print(f"📁 נוצרה תיקיית ערוץ בדרייב: '{sanitized_name}'", flush=True)
+                      resp = service.files().list(
+                          q=query,
+                          spaces='drive',
+                          fields='files(id, name)',
+                          supportsAllDrives=True,
+                          includeItemsFromAllDrives=True
+                      ).execute()
+                      files = resp.get('files', [])
 
-                  channel_folders_cache[sanitized_name] = folder_id
-                  return folder_id
+                      if files:
+                          folder_id = files[0]['id']
+                      else:
+                          file_metadata = {
+                              'name': sanitized_name,
+                              'mimeType': 'application/vnd.google-apps.folder',
+                              'parents': [ROOT_FOLDER_ID]
+                          }
+                          folder = service.files().create(body=file_metadata, fields='id', supportsAllDrives=True).execute()
+                          folder_id = folder.get('id')
+                          print(f"📁 נוצרה תיקייה חדשה בדרייב עבור: '{sanitized_name}'", flush=True)
+
+                      channel_folders_cache[sanitized_name] = folder_id
+                      return folder_id
+                  except Exception as e:
+                      print(f"⚠️ הערה: לא ניתן היה לקבוע תיקייה עבור '{sanitized_name}': {e}. הקובץ יעלה לתיקיית השורש.", flush=True)
+                      return ROOT_FOLDER_ID
 
           all_videos_dict = {}
           for q_target in target_queries:
@@ -328,33 +338,37 @@ jobs:
                       break
 
                   filepath, title, channel_name = item
-                  target_folder = get_or_create_channel_folder(channel_name)
-                  filename = os.path.basename(filepath)
-                  size_mb = os.path.getsize(filepath) / (1024 * 1024)
-                  print(f"🚀 [העלאה #{worker_id}] מעלה את '{title}' לתיקייה '{channel_name}' ({size_mb:.1f} MB)...", flush=True)
-
-                  for attempt in range(1, 4):
-                      try:
-                          meta = {'name': filename, 'parents': [target_folder]}
-                          media = MediaFileUpload(filepath, resumable=True, chunksize=64*1024*1024)
-                          req = worker_service.files().create(body=meta, media_body=media, fields='id', supportsAllDrives=True)
-                          resp = None
-                          while resp is None:
-                              status, resp = req.next_chunk()
-
-                          print(f"✅ [העלאה #{worker_id}] הושלם: {title}", flush=True)
-                          with uploaded_lock:
-                              uploaded_count += 1
-                          break
-                      except Exception as e:
-                          print(f"⚠️ [העלאה #{worker_id}] שגיאה בניסיון {attempt}/3 עבור {title}: {e}", flush=True)
-                          time.sleep(attempt * 2)
-
                   try:
-                      os.remove(filepath)
-                  except:
-                      pass
-                  upload_queue.task_done()
+                      target_folder = get_or_create_channel_folder(channel_name)
+                      filename = os.path.basename(filepath)
+                      size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                      print(f"🚀 [העלאה #{worker_id}] מעלה את '{title}' לתיקייה '{channel_name}' ({size_mb:.1f} MB)...", flush=True)
+
+                      for attempt in range(1, 4):
+                          try:
+                              meta = {'name': filename, 'parents': [target_folder]}
+                              media = MediaFileUpload(filepath, resumable=True, chunksize=64*1024*1024)
+                              req = worker_service.files().create(body=meta, media_body=media, fields='id', supportsAllDrives=True)
+                              resp = None
+                              while resp is None:
+                                  status, resp = req.next_chunk()
+
+                              print(f"✅ [העלאה #{worker_id}] הושלם: {title}", flush=True)
+                              with uploaded_lock:
+                                  uploaded_count += 1
+                              break
+                          except Exception as e:
+                              print(f"⚠️ [העלאה #{worker_id}] שגיאה בניסיון {attempt}/3 עבור {title}: {e}", flush=True)
+                              time.sleep(attempt * 2)
+                  except Exception as e:
+                      print(f"❌ [העלאה #{worker_id}] שגיאה כללית בהעלאת {title}: {e}", flush=True)
+                  finally:
+                      try:
+                          if os.path.exists(filepath):
+                              os.remove(filepath)
+                      except:
+                          pass
+                      upload_queue.task_done()
 
           upload_threads = []
           for i in range(UP_WORKERS):
