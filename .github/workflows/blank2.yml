@@ -288,6 +288,3 @@ jobs:
 
           echo "התהליך הסתיים בהצלחה!"
           rm -f sa_key.json upload_single.py archive.txt cookies.txt
-
-
-אני רוצה להעלות את הפטריוטים האחרון אבל לתוך הגיטהאב ולא לדרייב
