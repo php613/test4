@@ -1,0 +1,317 @@
+name: Fast Parallel YouTube to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel_select:
+        description: 'בחר ערוץ להורדה'
+        required: true
+        default: 'yuval_hofesh'
+        type: choice
+        options:
+          - 'yuval_hofesh'
+          - 'yuvaliya'
+          - 'custom'
+      custom_url:
+        description: 'קישור מותאם אישית (אם נבחר custom)'
+        required: false
+        default: ''
+        type: string
+      download_workers:
+        description: 'מספר הורדות במקביל (מומלץ 2-3 כדי לא לקבל חסימה מיוטיוב)'
+        required: true
+        default: '2'
+        type: string
+      upload_workers:
+        description: 'מספר העלאות במקביל לדרייב'
+        required: true
+        default: '3'
+        type: string
+      quality:
+        description: 'איכות מקסימלית'
+        required: true
+        default: '1080'
+        type: choice
+        options:
+          - '720'
+          - '1080'
+          - '1440'
+          - '2160'
+
+permissions:
+  contents: read
+
+jobs:
+  parallel-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 1. פינוי כ-25GB של מקום פנוי נוסף בדיסק של ה-Runner
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          df -h
+
+      # 2. קאש לחבילות PIP
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-parallel-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # 3. התקנת כלים, רשת ו-Cloudflare WARP
+      - name: Setup Tools & Cloudflare WARP
+        run: |
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp
+
+          sudo systemctl enable --now warp-svc
+          sleep 2
+          warp-cli --accept-tos registration new || true
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+          sleep 3
+
+          pip install -U "yt-dlp[default,curl-cffi]" google-api-python-client google-auth-httplib2 google-auth-oauthlib
+
+      # 4. הכנת מפתחות אימות
+      - name: Setup Auth Keys
+        env:
+          GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
+        run: |
+          echo "$GDRIVE_SA_KEY" > sa_key.json
+          if [ -n "$YOUTUBE_COOKIES" ]; then
+            echo "$YOUTUBE_COOKIES" > cookies.txt
+            echo "הוגדרו עוגיות אימות מול יוטיוב."
+          fi
+
+      # 5. הרצת מנוע ההורדות וההעלאות המקבילי (Pipeline)
+      - name: Run Parallel Pipeline
+        env:
+          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          CHANNEL_SELECT: ${{ github.event.inputs.channel_select }}
+          CUSTOM_URL: ${{ github.event.inputs.custom_url }}
+          DL_WORKERS: ${{ github.event.inputs.download_workers }}
+          UP_WORKERS: ${{ github.event.inputs.upload_workers }}
+          HEIGHT: ${{ github.event.inputs.quality }}
+        run: |
+          python3 - << 'EOF'
+          import os
+          import sys
+          import time
+          import shutil
+          import queue
+          import threading
+          import subprocess
+          from concurrent.futures import ThreadPoolExecutor
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          # הגדרות סביבה
+          FOLDER_ID = os.environ.get('FOLDER_ID', '').strip()
+          CHANNEL_SEL = os.environ.get('CHANNEL_SELECT', 'yuval_hofesh')
+          CUSTOM_URL = os.environ.get('CUSTOM_URL', '').strip()
+          DL_WORKERS = int(os.environ.get('DL_WORKERS', 2))
+          UP_WORKERS = int(os.environ.get('UP_WORKERS', 3))
+          HEIGHT = os.environ.get('HEIGHT', '1080')
+
+          if CHANNEL_SEL == 'yuval_hofesh':
+              TARGET_URL = 'https://www.youtube.com/@yuvalhofesh5129/videos'
+          elif CHANNEL_SEL == 'yuvaliya':
+              TARGET_URL = 'https://www.youtube.com/@%D7%99%D7%95%D7%91%D7%9C%D7%99%D7%94/videos'
+          else:
+              TARGET_URL = CUSTOM_URL
+
+          DOWNLOAD_DIR = 'downloads'
+          os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+          # התחברות ל-Google Drive
+          SCOPES = ['https://www.googleapis.com/auth/drive']
+          creds = service_account.Credentials.from_service_account_file('sa_key.json', scopes=SCOPES)
+          service = build('drive', 'v3', credentials=creds)
+
+          # 1. מיפוי קבצים שכבר קיימים בדרייב
+          print("🔍 סורק קבצים קיימים ב-Google Drive...", flush=True)
+          existing_files = set()
+          page_token = None
+          while True:
+              try:
+                  resp = service.files().list(
+                      q=f"'{FOLDER_ID}' in parents and trashed = false",
+                      pageSize=1000,
+                      supportsAllDrives=True,
+                      includeItemsFromAllDrives=True,
+                      fields="nextPageToken, files(id, name)",
+                      pageToken=page_token
+                  ).execute()
+                  for f in resp.get('files', []):
+                      base = os.path.splitext(f['name'])[0].strip().lower()
+                      existing_files.add(base)
+                  page_token = resp.get('nextPageToken')
+                  if not page_token:
+                      break
+              except Exception as e:
+                  print(f"שגיאה בסריקת דרייב: {e}")
+                  break
+          print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בדרייב.", flush=True)
+
+          # 2. שליפת רשימת הסרטונים מהערוץ
+          print(f"📡 שולף רשימת סרטונים מ: {TARGET_URL}...", flush=True)
+          cmd_list = [
+              "yt-dlp",
+              "--proxy", "socks5://127.0.0.1:40000",
+              "--extractor-args", "generic:impersonate",
+              "--flat-playlist",
+              "--print", "%(id)s\t%(title)s"
+          ]
+          if os.path.isfile("cookies.txt"):
+              cmd_list.extend(["--cookies", "cookies.txt"])
+          cmd_list.append(TARGET_URL)
+
+          proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          if proc.returncode != 0:
+              print(f"שגיאה בשליפת הערוץ: {proc.stderr}", flush=True)
+              sys.exit(1)
+
+          all_videos = []
+          for line in proc.stdout.strip().split('\n'):
+              if '\t' in line:
+                  v_id, v_title = line.split('\t', 1)
+                  all_videos.append((v_id.strip(), v_title.strip()))
+
+          print(f"🎬 סך הכל סרטונים בערוץ: {len(all_videos)}")
+
+          # סינון סרטונים שכבר הועלו בעבר
+          pending_videos = []
+          for v_id, v_title in all_videos:
+              v_clean = v_title.strip().lower()
+              already_uploaded = False
+              for ex in existing_files:
+                  if (len(ex) > 3 and (ex in v_clean or v_clean in ex)) or (v_id and v_id in ex):
+                      already_uploaded = True
+                      break
+              if not already_uploaded:
+                  pending_videos.append((v_id, v_title))
+
+          print(f"⏳ סרטונים חדשים להורדה והעלאה: {len(pending_videos)}", flush=True)
+          if not pending_videos:
+              print("🎉 כל הסרטונים כבר קיימים בדרייב! אין צורך בפעולה נוספת.")
+              sys.exit(0)
+
+          # תור העלאות
+          upload_queue = queue.Queue()
+          stop_signal = object()
+
+          # פונקציית בדיקת שטח פנוי בדיסק (מניעת קריסה)
+          def check_disk_space():
+              total, used, free = shutil.disk_usage('.')
+              free_gb = free / (1024 ** 3)
+              return free_gb
+
+          # פונקציית העלאה לדרייב (צרכן)
+          def upload_worker(worker_id):
+              # כל Thread מקבל Service משלו למניעת תקלות Socket
+              worker_service = build('drive', 'v3', credentials=creds)
+              while True:
+                  item = upload_queue.get()
+                  if item is stop_signal:
+                      upload_queue.put(stop_signal)
+                      break
+
+                  filepath, title = item
+                  filename = os.path.basename(filepath)
+                  size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                  print(f"🚀 [העלאה #{worker_id}] מתחיל: {title} ({size_mb:.1f} MB)...", flush=True)
+
+                  try:
+                      meta = {'name': filename, 'parents': [FOLDER_ID]}
+                      media = MediaFileUpload(filepath, resumable=True, chunksize=10*1024*1024)
+                      req = worker_service.files().create(body=meta, media_body=media, fields='id', supportsAllDrives=True)
+                      resp = None
+                      while resp is None:
+                          status, resp = req.next_chunk()
+
+                      print(f"✅ [העלאה #{worker_id}] הושלם ונמחק: {title}", flush=True)
+                  except Exception as e:
+                      print(f"❌ [העלאה #{worker_id}] שגיאה בהעלאת {title}: {e}", flush=True)
+                  finally:
+                      try:
+                          os.remove(filepath)
+                      except:
+                          pass
+                      upload_queue.task_done()
+
+          # הפעלת Threads של העלאה
+          upload_threads = []
+          for i in range(UP_WORKERS):
+              t = threading.Thread(target=upload_worker, args=(i + 1,), daemon=True)
+              t.start()
+              upload_threads.append(t)
+
+          # פונקציית הורדת סרטון בודד (יצרן)
+          def download_video(item):
+              v_id, v_title = item
+
+              # בדיקת שטח פנוי לפני הורדה
+              while check_disk_space() < 4.0:
+                  print(f"⚠️ דיסק עמוס ({check_disk_space():.1f} GB פנויים). ממתין שהעלאות יפנו מקום...", flush=True)
+                  time.sleep(10)
+
+              url = f"https://www.youtube.com/watch?v={v_id}"
+              out_tmpl = f"{DOWNLOAD_DIR}/%(title).100s [{v_id}].%(ext)s"
+
+              cmd_dl = [
+                  "yt-dlp",
+                  "--proxy", "socks5://127.0.0.1:40000",
+                  "--extractor-args", "generic:impersonate",
+                  "-N", "4",
+                  "--socket-timeout", "30",
+                  "--retries", "3",
+                  "--windows-filenames",
+                  "-f", f"bestvideo[height<={HEIGHT}]+bestaudio/best[height<={HEIGHT}]/best",
+                  "--merge-output-format", "mp4",
+                  "-o", out_tmpl,
+                  url
+              ]
+              if os.path.isfile("cookies.txt"):
+                  cmd_dl.extend(["--cookies", "cookies.txt"])
+
+              print(f"📥 [הורדה] מתחיל: {v_title}", flush=True)
+              proc = subprocess.run(cmd_dl, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+              if proc.returncode == 0:
+                  # איתור הקובץ שירד והעברתו לתור ההעלאה
+                  for fname in os.listdir(DOWNLOAD_DIR):
+                      if v_id in fname and not fname.endswith('.part'):
+                          fpath = os.path.join(DOWNLOAD_DIR, fname)
+                          upload_queue.put((fpath, v_title))
+                          print(f"⚡ [מוכן להעלאה]: {v_title}", flush=True)
+                          break
+              else:
+                  print(f"⚠️ [שגיאת הורדה] {v_title}: {proc.stderr.decode()[:150]}", flush=True)
+
+          # הרצת ההורדות במקביל
+          print(f"🔥 מפעיל {DL_WORKERS} הורדות ו-{UP_WORKERS} העלאות בו-זמנית...", flush=True)
+          with ThreadPoolExecutor(max_workers=DL_WORKERS) as dl_pool:
+              dl_pool.map(download_video, pending_videos)
+
+          # סיום: המתנה לסיום כל ההעלאות שבתור
+          print("🏁 כל ההורדות הסתיימו. ממתין לסיום אחרון הקבצים בתור ההעלאה...", flush=True)
+          upload_queue.join()
+          upload_queue.put(stop_signal)
+
+          for t in upload_threads:
+              t.join()
+
+          print("🎉 כל הסרטונים הורדו, הועלו ונמחקו בהצלחה מלאה!", flush=True)
+          EOF
+
+          rm -f sa_key.json cookies.txt
