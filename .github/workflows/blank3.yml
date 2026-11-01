@@ -1,4 +1,4 @@
-name: Fast Parallel YouTube to Google Drive (Global & Accelerated)
+name: הורדה מקבילית
 
 on:
   workflow_dispatch:
