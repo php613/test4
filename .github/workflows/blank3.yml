@@ -1,19 +1,15 @@
-name: Fast Parallel YouTube to Google Drive
+name: Fast Parallel YouTube to Google Drive (Global & Accelerated)
 
 on:
   workflow_dispatch:
     inputs:
-      channel_select:
-        description: 'בחר ערוץ להורדה'
+      target_input:
+        description: 'קישור לערוץ / פלייליסט / סרטון, או מילות חיפוש חופשי'
         required: true
-        default: 'yuval_hofesh'
-        type: choice
-        options:
-          - 'yuval_hofesh'
-          - 'yuvaliya'
-          - 'custom'
+        default: 'https://www.youtube.com/@TED'
+        type: string
       content_type:
-        description: 'סוג תוכן להורדה'
+        description: 'סוג תוכן (רלוונטי רק לקישורי ערוצים)'
         required: true
         default: 'both'
         type: choice
@@ -21,30 +17,30 @@ on:
           - 'both'
           - 'videos'
           - 'shorts'
-      custom_url:
-        description: 'קישור מותאם אישית (ערוץ, פלייליסט או סרטון)'
+      search_limit:
+        description: 'כמות תוצאות מקסימלית (רלוונטי רק לחיפוש חופשי)'
         required: false
-        default: ''
+        default: '10'
         type: string
       custom_folder_id:
-        description: 'ID של תיקיית Google Drive (השאר ריק לברירת מחדל מה-Secret)'
+        description: 'ID של תיקיית האב ב-Google Drive (השאר ריק לברירת מחדל מה-Secret)'
         required: false
         default: ''
         type: string
       download_workers:
-        description: 'מספר הורדות במקביל (מומלץ 2-3)'
+        description: 'מספר הורדות במקביל'
         required: true
-        default: '2'
+        default: '6'
         type: string
       upload_workers:
-        description: 'מספר העלאות במקביל לדרייב (מומלץ 3-5)'
+        description: 'מספר העלאות במקביל'
         required: true
-        default: '4'
+        default: '12'
         type: string
       quality:
-        description: 'איכות מקסימלית (פיקסלים בציר הקצר, למשל 1080)'
+        description: 'איכות מקסימלית (גובה/רוחב)'
         required: true
-        default: '1080'
+        default: '2160'
         type: choice
         options:
           - '720'
@@ -73,23 +69,22 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-parallel-v3
+          key: ${{ runner.os }}-pip-parallel-v4
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 3. התקנת כלים, Deno JS Runtime ו-Cloudflare WARP
-      - name: Setup Tools, Deno & Cloudflare WARP
+      # 3. התקנת כלים, Deno, aria2c (להאצה) ו-Cloudflare WARP
+      - name: Setup Tools, aria2c, Deno & Cloudflare WARP
         run: |
-          # התקנת Deno (פותר את שגיאות ה-JavaScript ביוטיוב)
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           export PATH="$HOME/.deno/bin:$PATH"
 
-          # התקנת WARP ו-FFmpeg
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
 
-          sudo apt-get update && sudo apt-get install -y ffmpeg cloudflare-warp
+          # התקנת aria2 מאיצה מאוד את ההורדות מיוטיוב
+          sudo apt-get update && sudo apt-get install -y ffmpeg aria2 cloudflare-warp
 
           sudo systemctl enable --now warp-svc
           sleep 2
@@ -112,14 +107,14 @@ jobs:
             echo "הוגדרו עוגיות אימות מול יוטיוב."
           fi
 
-      # 5. הרצת מנוע ההורדות וההעלאות המקבילי
-      - name: Run Parallel Pipeline
+      # 5. הרצת מנוע ההורדות וההעלאות
+      - name: Run Accelerated Pipeline
         env:
           SECRET_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
           CUSTOM_FOLDER_ID: ${{ github.event.inputs.custom_folder_id }}
-          CHANNEL_SELECT: ${{ github.event.inputs.channel_select }}
+          TARGET_INPUT: ${{ github.event.inputs.target_input }}
           CONTENT_TYPE: ${{ github.event.inputs.content_type }}
-          CUSTOM_URL: ${{ github.event.inputs.custom_url }}
+          SEARCH_LIMIT: ${{ github.event.inputs.search_limit }}
           DL_WORKERS: ${{ github.event.inputs.download_workers }}
           UP_WORKERS: ${{ github.event.inputs.upload_workers }}
           HEIGHT: ${{ github.event.inputs.quality }}
@@ -132,56 +127,54 @@ jobs:
           import queue
           import threading
           import subprocess
+          import re
           from concurrent.futures import ThreadPoolExecutor
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          # הגדרת תיקיית יעד ב-Drive (קדימות לקלט ידני)
           CUSTOM_FOLDER = os.environ.get('CUSTOM_FOLDER_ID', '').strip()
           SECRET_FOLDER = os.environ.get('SECRET_FOLDER_ID', '').strip()
-          FOLDER_ID = CUSTOM_FOLDER if CUSTOM_FOLDER else SECRET_FOLDER
+          ROOT_FOLDER_ID = CUSTOM_FOLDER if CUSTOM_FOLDER else SECRET_FOLDER
 
-          if not FOLDER_ID:
-              print("❌ שגיאה: לא הוגדר Folder ID! אנא הזן אותו בקלט הידני או ב-Secrets.", flush=True)
+          if not ROOT_FOLDER_ID:
+              print("❌ שגיאה: לא הוגדר Folder ID בדרייב!", flush=True)
               sys.exit(1)
 
-          CHANNEL_SEL = os.environ.get('CHANNEL_SELECT', 'yuval_hofesh')
+          TARGET_INPUT = os.environ.get('TARGET_INPUT', '').strip()
           CONTENT_TYPE = os.environ.get('CONTENT_TYPE', 'both')
-          CUSTOM_URL = os.environ.get('CUSTOM_URL', '').strip()
-          DL_WORKERS = int(os.environ.get('DL_WORKERS', 2))
-          UP_WORKERS = int(os.environ.get('UP_WORKERS', 4))
+          SEARCH_LIMIT = os.environ.get('SEARCH_LIMIT', '10').strip()
+          DL_WORKERS = int(os.environ.get('DL_WORKERS', 3))
+          UP_WORKERS = int(os.environ.get('UP_WORKERS', 5))
           HEIGHT = os.environ.get('HEIGHT', '1080')
 
-          # הגדרת כתובות בסיס לפי הבחירה
-          if CHANNEL_SEL == 'yuval_hofesh':
-              base_url = 'https://www.youtube.com/@yuvalhofesh5129'
-          elif CHANNEL_SEL == 'yuvaliya':
-              base_url = 'https://www.youtube.com/@%D7%99%D7%95%D7%91%D7%9C%D7%99%D7%94'
-          else:
-              if not CUSTOM_URL:
-                  print("❌ שגיאה: נבחר Custom URL אך השדה הושאר ריק!", flush=True)
-                  sys.exit(1)
-              base_url = CUSTOM_URL.rstrip('/')
+          if not TARGET_INPUT:
+              print("❌ שגיאה: לא הוזן קישור או מילות חיפוש!", flush=True)
+              sys.exit(1)
 
-          # בניית רשימת הקישורים לסריקה לפי סוג התוכן
-          target_urls = []
-          # אם מדובר בקישור לסרטון בודד או לפלייליסט ספציפי
-          if 'watch?v=' in base_url or 'youtu.be/' in base_url or 'playlist?list=' in base_url:
-              target_urls = [base_url]
-          else:
-              # ניקוי סיומות קיימות אם הוזנו ידנית ב-Custom URL
-              for suffix in ['/videos', '/shorts', '/featured', '/streams']:
-                  if base_url.endswith(suffix):
-                      base_url = base_url[:-len(suffix)]
-                      break
+          is_url = TARGET_INPUT.startswith('http://') or TARGET_INPUT.startswith('https://')
 
-              if CONTENT_TYPE == 'videos':
-                  target_urls = [f"{base_url}/videos"]
-              elif CONTENT_TYPE == 'shorts':
-                  target_urls = [f"{base_url}/shorts"]
-              else:  # both
-                  target_urls = [f"{base_url}/videos", f"{base_url}/shorts"]
+          target_queries = []
+          if not is_url:
+              # חיפוש חופשי
+              print(f"🔎 זוהה חיפוש חופשי עבור: '{TARGET_INPUT}' (מקסימום {SEARCH_LIMIT} תוצאות)", flush=True)
+              target_queries = [f"ytsearch{SEARCH_LIMIT}:{TARGET_INPUT}"]
+          else:
+              base_url = TARGET_INPUT.rstrip('/')
+              if any(x in base_url for x in ['watch?v=', 'youtu.be/', 'playlist?list=']):
+                  target_queries = [base_url]
+              else:
+                  for suffix in ['/videos', '/shorts', '/featured', '/streams']:
+                      if base_url.endswith(suffix):
+                          base_url = base_url[:-len(suffix)]
+                          break
+
+                  if CONTENT_TYPE == 'videos':
+                      target_queries = [f"{base_url}/videos"]
+                  elif CONTENT_TYPE == 'shorts':
+                      target_queries = [f"{base_url}/shorts"]
+                  else:
+                      target_queries = [f"{base_url}/videos", f"{base_url}/shorts"]
 
           DOWNLOAD_DIR = 'downloads'
           os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -190,14 +183,90 @@ jobs:
           creds = service_account.Credentials.from_service_account_file('sa_key.json', scopes=SCOPES)
           service = build('drive', 'v3', credentials=creds)
 
-          # 1. סריקת קבצים קיימים בתיקיית הדרייב
-          print(f"🔍 סורק קבצים קיימים ב-Google Drive (תיקייה: {FOLDER_ID})...", flush=True)
-          existing_files = set()
+          # ניהול תיקיות ערוצים בדרייב (Cache מקומי למניעת קריאות API כפולות)
+          channel_folders_cache = {}
+          folder_lock = threading.Lock()
+
+          def get_or_create_channel_folder(channel_name):
+              sanitized_name = re.sub(r'[\\/*?:"<>|]', "", channel_name).strip() or "Unknown Channel"
+              with folder_lock:
+                  if sanitized_name in channel_folders_cache:
+                      return channel_folders_cache[sanitized_name]
+
+                  query = (f"'{ROOT_FOLDER_ID}' in parents and "
+                           f"name = '{sanitized_name}' and "
+                           f"mimeType = 'application/vnd.google-apps.folder' and "
+                           f"trashed = false")
+                  resp = service.files().list(
+                      q=query,
+                      spaces='drive',
+                      fields='files(id, name)',
+                      supportsAllDrives=True,
+                      includeItemsFromAllDrives=True
+                  ).execute()
+                  files = resp.get('files', [])
+
+                  if files:
+                      folder_id = files[0]['id']
+                  else:
+                      file_metadata = {
+                          'name': sanitized_name,
+                          'mimeType': 'application/vnd.google-apps.folder',
+                          'parents': [ROOT_FOLDER_ID]
+                      }
+                      folder = service.files().create(body=file_metadata, fields='id', supportsAllDrives=True).execute()
+                      folder_id = folder.get('id')
+                      print(f"📁 נוצרה תיקייה חדשה בדרייב עבור הערוץ: '{sanitized_name}'", flush=True)
+
+                  channel_folders_cache[sanitized_name] = folder_id
+                  return folder_id
+
+          # 1. שליפת מידע על הסרטונים
+          all_videos_dict = {}  # {v_id: {'title': ..., 'channel': ...}}
+          for q_target in target_queries:
+              print(f"📡 שולף נתונים עבור: {q_target}...", flush=True)
+              cmd_list = [
+                  "yt-dlp",
+                  "--proxy", "socks5://127.0.0.1:40000",
+                  "--extractor-args", "generic:impersonate",
+                  "--js-runtimes", "deno,node",
+                  "--flat-playlist",
+                  "--print", "%(id)s\t%(uploader,channel)s\t%(title)s"
+              ]
+              if os.path.isfile("cookies.txt"):
+                  cmd_list.extend(["--cookies", "cookies.txt"])
+              cmd_list.append(q_target)
+
+              proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              if proc.returncode != 0:
+                  print(f"⚠️ הערה / שגיאה: {proc.stderr.strip()[:200]}", flush=True)
+                  continue
+
+              for line in proc.stdout.strip().split('\n'):
+                  parts = line.split('\t')
+                  if len(parts) >= 3:
+                      v_id, v_channel, v_title = parts[0].strip(), parts[1].strip(), parts[2].strip()
+                      if v_id and v_id not in all_videos_dict:
+                          all_videos_dict[v_id] = {
+                              'id': v_id,
+                              'channel': v_channel if v_channel and v_channel != 'NA' else 'Other',
+                              'title': v_title
+                          }
+
+          all_videos = list(all_videos_dict.values())
+          print(f"🎬 נמצאו סה\"כ {len(all_videos)} סרטונים.")
+          if not all_videos:
+              print("לא נמצאו סרטונים לתהליך.")
+              sys.exit(0)
+
+          # 2. סריקת קבצים קיימים בדרייב (בדיקה כללית)
+          print(f"🔍 בודק קבצים קיימים בדרייב...", flush=True)
+          existing_names = set()
           page_token = None
           while True:
               try:
                   resp = service.files().list(
-                      q=f"'{FOLDER_ID}' in parents and trashed = false",
+                      q="trashed = false",
                       pageSize=1000,
                       supportsAllDrives=True,
                       includeItemsFromAllDrives=True,
@@ -205,63 +274,25 @@ jobs:
                       pageToken=page_token
                   ).execute()
                   for f in resp.get('files', []):
-                      base = os.path.splitext(f['name'])[0].strip().lower()
-                      existing_files.add(base)
+                      existing_names.add(f['name'].lower())
                   page_token = resp.get('nextPageToken')
                   if not page_token:
                       break
               except Exception as e:
-                  print(f"שגיאה בסריקת דרייב: {e}")
+                  print(f"שגיאה קלה בסריקת קבצים: {e}")
                   break
-          print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בדרייב.", flush=True)
 
-          # 2. שליפת רשימת סרטונים
-          all_videos_dict = {}  # מניעת כפילויות לפי Video ID
-          for t_url in target_urls:
-              print(f"📡 שולף רשימת סרטונים מ: {t_url}...", flush=True)
-              cmd_list = [
-                  "yt-dlp",
-                  "--proxy", "socks5://127.0.0.1:40000",
-                  "--extractor-args", "generic:impersonate",
-                  "--js-runtimes", "deno,node",
-                  "--flat-playlist",
-                  "--print", "%(id)s\t%(title)s"
-              ]
-              if os.path.isfile("cookies.txt"):
-                  cmd_list.extend(["--cookies", "cookies.txt"])
-              cmd_list.append(t_url)
-
-              proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-              if proc.returncode != 0:
-                  print(f"⚠️ הערה / שגיאה בשליפת {t_url}: {proc.stderr.strip()[:200]}", flush=True)
-                  continue
-
-              for line in proc.stdout.strip().split('\n'):
-                  if '\t' in line:
-                      v_id, v_title = line.split('\t', 1)
-                      v_id = v_id.strip()
-                      v_title = v_title.strip()
-                      if v_id and v_id not in all_videos_dict:
-                          all_videos_dict[v_id] = v_title
-
-          all_videos = list(all_videos_dict.items())
-          print(f"🎬 סך הכל סרטונים ייחודיים שנמצאו: {len(all_videos)}")
-
-          # בדיקה מה כבר קיים בדרייב
           pending_videos = []
-          for v_id, v_title in all_videos:
-              v_clean = v_title.strip().lower()
-              already_uploaded = False
-              for ex in existing_files:
-                  if (v_id and v_id in ex) or (len(ex) > 3 and (ex in v_clean or v_clean in ex)):
-                      already_uploaded = True
-                      break
-              if not already_uploaded:
-                  pending_videos.append((v_id, v_title))
+          for item in all_videos:
+              v_id = item['id']
+              # בדיקה לפי Video ID בשם הקובץ
+              exists = any(v_id.lower() in fname for fname in existing_names)
+              if not exists:
+                  pending_videos.append(item)
 
-          print(f"⏳ סרטונים חדשים להורדה והעלאה: {len(pending_videos)}", flush=True)
+          print(f"⏳ סרטונים חדשים להורדה: {len(pending_videos)}", flush=True)
           if not pending_videos:
-              print("🎉 כל הסרטונים שנבחרו כבר קיימים בדרייב! אין צורך בפעולה נוספת.")
+              print("🎉 כל הסרטונים כבר קיימים בדרייב!")
               sys.exit(0)
 
           upload_queue = queue.Queue()
@@ -270,9 +301,10 @@ jobs:
           uploaded_lock = threading.Lock()
 
           def check_disk_space():
-              total, used, free = shutil.disk_usage('.')
+              _, _, free = shutil.disk_usage('.')
               return free / (1024 ** 3)
 
+          # 3. תהליך העלאה עם מנגנון Retry
           def upload_worker(worker_id):
               global uploaded_count
               worker_service = build('drive', 'v3', credentials=creds)
@@ -282,30 +314,37 @@ jobs:
                       upload_queue.put(stop_signal)
                       break
 
-                  filepath, title = item
+                  filepath, title, channel_name = item
+                  target_folder = get_or_create_channel_folder(channel_name)
                   filename = os.path.basename(filepath)
                   size_mb = os.path.getsize(filepath) / (1024 * 1024)
-                  print(f"🚀 [העלאה #{worker_id}] מעלה לדרייב: {title} ({size_mb:.1f} MB)...", flush=True)
+                  print(f"🚀 [העלאה #{worker_id}] מעלה את '{title}' לתיקייה '{channel_name}' ({size_mb:.1f} MB)...", flush=True)
+
+                  uploaded_successfully = False
+                  for attempt in range(1, 4):  # עד 3 ניסיונות
+                      try:
+                          meta = {'name': filename, 'parents': [target_folder]}
+                          # chunksize 64MB להאצה משמעותית
+                          media = MediaFileUpload(filepath, resumable=True, chunksize=64*1024*1024)
+                          req = worker_service.files().create(body=meta, media_body=media, fields='id', supportsAllDrives=True)
+                          resp = None
+                          while resp is None:
+                              status, resp = req.next_chunk()
+
+                          print(f"✅ [העלאה #{worker_id}] הושלם בהצלחה: {title}", flush=True)
+                          with uploaded_lock:
+                              uploaded_count += 1
+                          uploaded_successfully = True
+                          break
+                      except Exception as e:
+                          print(f"⚠️ [העלאה #{worker_id}] שגיאה (ניסיון {attempt}/3) עבור {title}: {e}", flush=True)
+                          time.sleep(attempt * 4)
 
                   try:
-                      meta = {'name': filename, 'parents': [FOLDER_ID]}
-                      media = MediaFileUpload(filepath, resumable=True, chunksize=10*1024*1024)
-                      req = worker_service.files().create(body=meta, media_body=media, fields='id', supportsAllDrives=True)
-                      resp = None
-                      while resp is None:
-                          status, resp = req.next_chunk()
-
-                      print(f"✅ [העלאה #{worker_id}] הושלם ונמחק בהצלחה: {title}", flush=True)
-                      with uploaded_lock:
-                          uploaded_count += 1
-                  except Exception as e:
-                      print(f"❌ [העלאה #{worker_id}] שגיאה בהעלאת {title}: {e}", flush=True)
-                  finally:
-                      try:
-                          os.remove(filepath)
-                      except:
-                          pass
-                      upload_queue.task_done()
+                      os.remove(filepath)
+                  except:
+                      pass
+                  upload_queue.task_done()
 
           upload_threads = []
           for i in range(UP_WORKERS):
@@ -313,17 +352,19 @@ jobs:
               t.start()
               upload_threads.append(t)
 
+          # 4. תהליך הורדה עם aria2c והאצה + Retry
           def download_video(item):
-              v_id, v_title = item
+              v_id = item['id']
+              v_title = item['title']
+              v_channel = item['channel']
 
-              while check_disk_space() < 4.0:
-                  print(f"⚠️ דיסק עמוס ({check_disk_space():.1f} GB פנויים). ממתין שהעלאות יפנו מקום...", flush=True)
-                  time.sleep(10)
+              while check_disk_space() < 3.5:
+                  print(f"⚠️ דיסק מלא ({check_disk_space():.1f} GB פנויים). ממתין לפינוי...", flush=True)
+                  time.sleep(8)
 
               url = f"https://www.youtube.com/watch?v={v_id}"
               out_tmpl = f"{DOWNLOAD_DIR}/%(title).100s [{v_id}].%(ext)s"
 
-              # תמיכה ברזולוציה אופקית (רגילה) ואנכית (שורטס 1080x1920)
               format_str = (
                   f"bestvideo[height<={HEIGHT}]+bestaudio/"
                   f"bestvideo[width<={HEIGHT}]+bestaudio/"
@@ -335,9 +376,11 @@ jobs:
                   "--proxy", "socks5://127.0.0.1:40000",
                   "--extractor-args", "generic:impersonate",
                   "--js-runtimes", "deno,node",
-                  "-N", "4",
+                  "--external-downloader", "aria2c",
+                  "--external-downloader-args", "-x 16 -s 16 -k 1M",
                   "--socket-timeout", "30",
-                  "--retries", "3",
+                  "--retries", "5",
+                  "--fragment-retries", "5",
                   "--windows-filenames",
                   "-f", format_str,
                   "--merge-output-format", "mp4",
@@ -347,32 +390,40 @@ jobs:
               if os.path.isfile("cookies.txt"):
                   cmd_dl.extend(["--cookies", "cookies.txt"])
 
-              print(f"📥 [הורדה] מתחיל: {v_title}", flush=True)
-              proc = subprocess.run(cmd_dl, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+              # לולאת Retry להורדה (2 ניסיונות)
+              success = False
+              for attempt in range(1, 3):
+                  print(f"📥 [הורדה] מתחיל ({attempt}/2): {v_title}", flush=True)
+                  proc = subprocess.run(cmd_dl, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                  if proc.returncode == 0:
+                      success = True
+                      break
+                  else:
+                      print(f"⚠️ שגיאה בהורדת {v_title} בניסיון {attempt}: {proc.stderr.strip()[-150:]}", flush=True)
+                      time.sleep(3)
 
-              if proc.returncode == 0:
+              if success:
                   for fname in os.listdir(DOWNLOAD_DIR):
                       if v_id in fname and not fname.endswith('.part'):
                           fpath = os.path.join(DOWNLOAD_DIR, fname)
-                          upload_queue.put((fpath, v_title))
-                          print(f"⚡ [מוכן להעלאה]: {v_title}", flush=True)
+                          upload_queue.put((fpath, v_title, v_channel))
+                          print(f"⚡ [מוכן להעלאה]: {v_title} -> ערוץ: {v_channel}", flush=True)
                           break
               else:
-                  err_msg = proc.stderr.strip()[-200:] if proc.stderr else "Unknown error"
-                  print(f"⚠️ [שגיאת הורדה] {v_title}: {err_msg}", flush=True)
+                  print(f"❌ נכשלה הורדת הסרטון לאחר ניסיונות חוזרים: {v_title}", flush=True)
 
-          print(f"🔥 מפעיל {DL_WORKERS} הורדות ו-{UP_WORKERS} העלאות בו-זמנית...", flush=True)
+          print(f"🔥 מתחיל עבודה מקבילית: {DL_WORKERS} הורדות במקביל, {UP_WORKERS} העלאות...", flush=True)
           with ThreadPoolExecutor(max_workers=DL_WORKERS) as dl_pool:
               dl_pool.map(download_video, pending_videos)
 
-          print("🏁 כל ההורדות הסתיימו. ממתין לסיום ההעלאות בתור...", flush=True)
+          print("🏁 כל ההורדות הושלמו. ממתין לסיום תור ההעלאות...", flush=True)
           upload_queue.join()
           upload_queue.put(stop_signal)
 
           for t in upload_threads:
               t.join()
 
-          print(f"🎉 התהליך הסתיים! סך הכל סרטונים שהועלו בהצלחה בסיבוב זה: {uploaded_count}/{len(pending_videos)}", flush=True)
+          print(f"🎉 הושלם בהצלחה! סה\"כ הועלו: {uploaded_count}/{len(pending_videos)}", flush=True)
           EOF
 
           rm -f sa_key.json cookies.txt
