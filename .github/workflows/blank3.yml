@@ -12,8 +12,22 @@ on:
           - 'yuval_hofesh'
           - 'yuvaliya'
           - 'custom'
+      content_type:
+        description: 'סוג תוכן להורדה'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'both'
+          - 'videos'
+          - 'shorts'
       custom_url:
-        description: 'קישור מותאם אישית (אם נבחר custom)'
+        description: 'קישור מותאם אישית (ערוץ, פלייליסט או סרטון)'
+        required: false
+        default: ''
+        type: string
+      custom_folder_id:
+        description: 'ID של תיקיית Google Drive (השאר ריק לברירת מחדל מה-Secret)'
         required: false
         default: ''
         type: string
@@ -28,7 +42,7 @@ on:
         default: '4'
         type: string
       quality:
-        description: 'איכות מקסימלית'
+        description: 'איכות מקסימלית (פיקסלים בציר הקצר, למשל 1080)'
         required: true
         default: '1080'
         type: choice
@@ -59,14 +73,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-parallel-v2
+          key: ${{ runner.os }}-pip-parallel-v3
           restore-keys: |
             ${{ runner.os }}-pip-
 
       # 3. התקנת כלים, Deno JS Runtime ו-Cloudflare WARP
       - name: Setup Tools, Deno & Cloudflare WARP
         run: |
-          # התקנת Deno (פותר את שגיאת ה-JavaScript ביוטיוב)
+          # התקנת Deno (פותר את שגיאות ה-JavaScript ביוטיוב)
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
           export PATH="$HOME/.deno/bin:$PATH"
@@ -101,8 +115,10 @@ jobs:
       # 5. הרצת מנוע ההורדות וההעלאות המקבילי
       - name: Run Parallel Pipeline
         env:
-          FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          SECRET_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          CUSTOM_FOLDER_ID: ${{ github.event.inputs.custom_folder_id }}
           CHANNEL_SELECT: ${{ github.event.inputs.channel_select }}
+          CONTENT_TYPE: ${{ github.event.inputs.content_type }}
           CUSTOM_URL: ${{ github.event.inputs.custom_url }}
           DL_WORKERS: ${{ github.event.inputs.download_workers }}
           UP_WORKERS: ${{ github.event.inputs.upload_workers }}
@@ -121,19 +137,51 @@ jobs:
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          FOLDER_ID = os.environ.get('FOLDER_ID', '').strip()
+          # הגדרת תיקיית יעד ב-Drive (קדימות לקלט ידני)
+          CUSTOM_FOLDER = os.environ.get('CUSTOM_FOLDER_ID', '').strip()
+          SECRET_FOLDER = os.environ.get('SECRET_FOLDER_ID', '').strip()
+          FOLDER_ID = CUSTOM_FOLDER if CUSTOM_FOLDER else SECRET_FOLDER
+
+          if not FOLDER_ID:
+              print("❌ שגיאה: לא הוגדר Folder ID! אנא הזן אותו בקלט הידני או ב-Secrets.", flush=True)
+              sys.exit(1)
+
           CHANNEL_SEL = os.environ.get('CHANNEL_SELECT', 'yuval_hofesh')
+          CONTENT_TYPE = os.environ.get('CONTENT_TYPE', 'both')
           CUSTOM_URL = os.environ.get('CUSTOM_URL', '').strip()
           DL_WORKERS = int(os.environ.get('DL_WORKERS', 2))
           UP_WORKERS = int(os.environ.get('UP_WORKERS', 4))
           HEIGHT = os.environ.get('HEIGHT', '1080')
 
+          # הגדרת כתובות בסיס לפי הבחירה
           if CHANNEL_SEL == 'yuval_hofesh':
-              TARGET_URL = 'https://www.youtube.com/@yuvalhofesh5129/videos'
+              base_url = 'https://www.youtube.com/@yuvalhofesh5129'
           elif CHANNEL_SEL == 'yuvaliya':
-              TARGET_URL = 'https://www.youtube.com/@%D7%99%D7%95%D7%91%D7%9C%D7%99%D7%94/videos'
+              base_url = 'https://www.youtube.com/@%D7%99%D7%95%D7%91%D7%9C%D7%99%D7%94'
           else:
-              TARGET_URL = CUSTOM_URL
+              if not CUSTOM_URL:
+                  print("❌ שגיאה: נבחר Custom URL אך השדה הושאר ריק!", flush=True)
+                  sys.exit(1)
+              base_url = CUSTOM_URL.rstrip('/')
+
+          # בניית רשימת הקישורים לסריקה לפי סוג התוכן
+          target_urls = []
+          # אם מדובר בקישור לסרטון בודד או לפלייליסט ספציפי
+          if 'watch?v=' in base_url or 'youtu.be/' in base_url or 'playlist?list=' in base_url:
+              target_urls = [base_url]
+          else:
+              # ניקוי סיומות קיימות אם הוזנו ידנית ב-Custom URL
+              for suffix in ['/videos', '/shorts', '/featured', '/streams']:
+                  if base_url.endswith(suffix):
+                      base_url = base_url[:-len(suffix)]
+                      break
+
+              if CONTENT_TYPE == 'videos':
+                  target_urls = [f"{base_url}/videos"]
+              elif CONTENT_TYPE == 'shorts':
+                  target_urls = [f"{base_url}/shorts"]
+              else:  # both
+                  target_urls = [f"{base_url}/videos", f"{base_url}/shorts"]
 
           DOWNLOAD_DIR = 'downloads'
           os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -142,8 +190,8 @@ jobs:
           creds = service_account.Credentials.from_service_account_file('sa_key.json', scopes=SCOPES)
           service = build('drive', 'v3', credentials=creds)
 
-          # 1. סריקת קבצים קיימים בדרייב
-          print("🔍 סורק קבצים קיימים ב-Google Drive...", flush=True)
+          # 1. סריקת קבצים קיימים בתיקיית הדרייב
+          print(f"🔍 סורק קבצים קיימים ב-Google Drive (תיקייה: {FOLDER_ID})...", flush=True)
           existing_files = set()
           page_token = None
           while True:
@@ -168,38 +216,44 @@ jobs:
           print(f"📁 נמצאו {len(existing_files)} קבצים קיימים בדרייב.", flush=True)
 
           # 2. שליפת רשימת סרטונים
-          print(f"📡 שולף רשימת סרטונים מ: {TARGET_URL}...", flush=True)
-          cmd_list = [
-              "yt-dlp",
-              "--proxy", "socks5://127.0.0.1:40000",
-              "--extractor-args", "generic:impersonate",
-              "--js-runtimes", "deno,node",
-              "--flat-playlist",
-              "--print", "%(id)s\t%(title)s"
-          ]
-          if os.path.isfile("cookies.txt"):
-              cmd_list.extend(["--cookies", "cookies.txt"])
-          cmd_list.append(TARGET_URL)
+          all_videos_dict = {}  # מניעת כפילויות לפי Video ID
+          for t_url in target_urls:
+              print(f"📡 שולף רשימת סרטונים מ: {t_url}...", flush=True)
+              cmd_list = [
+                  "yt-dlp",
+                  "--proxy", "socks5://127.0.0.1:40000",
+                  "--extractor-args", "generic:impersonate",
+                  "--js-runtimes", "deno,node",
+                  "--flat-playlist",
+                  "--print", "%(id)s\t%(title)s"
+              ]
+              if os.path.isfile("cookies.txt"):
+                  cmd_list.extend(["--cookies", "cookies.txt"])
+              cmd_list.append(t_url)
 
-          proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-          if proc.returncode != 0:
-              print(f"שגיאה בשליפת הערוץ: {proc.stderr}", flush=True)
-              sys.exit(1)
+              proc = subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              if proc.returncode != 0:
+                  print(f"⚠️ הערה / שגיאה בשליפת {t_url}: {proc.stderr.strip()[:200]}", flush=True)
+                  continue
 
-          all_videos = []
-          for line in proc.stdout.strip().split('\n'):
-              if '\t' in line:
-                  v_id, v_title = line.split('\t', 1)
-                  all_videos.append((v_id.strip(), v_title.strip()))
+              for line in proc.stdout.strip().split('\n'):
+                  if '\t' in line:
+                      v_id, v_title = line.split('\t', 1)
+                      v_id = v_id.strip()
+                      v_title = v_title.strip()
+                      if v_id and v_id not in all_videos_dict:
+                          all_videos_dict[v_id] = v_title
 
-          print(f"🎬 סך הכל סרטונים בערוץ: {len(all_videos)}")
+          all_videos = list(all_videos_dict.items())
+          print(f"🎬 סך הכל סרטונים ייחודיים שנמצאו: {len(all_videos)}")
 
+          # בדיקה מה כבר קיים בדרייב
           pending_videos = []
           for v_id, v_title in all_videos:
               v_clean = v_title.strip().lower()
               already_uploaded = False
               for ex in existing_files:
-                  if (len(ex) > 3 and (ex in v_clean or v_clean in ex)) or (v_id and v_id in ex):
+                  if (v_id and v_id in ex) or (len(ex) > 3 and (ex in v_clean or v_clean in ex)):
                       already_uploaded = True
                       break
               if not already_uploaded:
@@ -207,7 +261,7 @@ jobs:
 
           print(f"⏳ סרטונים חדשים להורדה והעלאה: {len(pending_videos)}", flush=True)
           if not pending_videos:
-              print("🎉 כל הסרטונים כבר קיימים בדרייב! אין צורך בפעולה נוספת.")
+              print("🎉 כל הסרטונים שנבחרו כבר קיימים בדרייב! אין צורך בפעולה נוספת.")
               sys.exit(0)
 
           upload_queue = queue.Queue()
@@ -269,6 +323,13 @@ jobs:
               url = f"https://www.youtube.com/watch?v={v_id}"
               out_tmpl = f"{DOWNLOAD_DIR}/%(title).100s [{v_id}].%(ext)s"
 
+              # תמיכה ברזולוציה אופקית (רגילה) ואנכית (שורטס 1080x1920)
+              format_str = (
+                  f"bestvideo[height<={HEIGHT}]+bestaudio/"
+                  f"bestvideo[width<={HEIGHT}]+bestaudio/"
+                  f"best[height<={HEIGHT}]/best[width<={HEIGHT}]/best"
+              )
+
               cmd_dl = [
                   "yt-dlp",
                   "--proxy", "socks5://127.0.0.1:40000",
@@ -278,7 +339,7 @@ jobs:
                   "--socket-timeout", "30",
                   "--retries", "3",
                   "--windows-filenames",
-                  "-f", f"bestvideo[height<={HEIGHT}]+bestaudio/best[height<={HEIGHT}]/best",
+                  "-f", format_str,
                   "--merge-output-format", "mp4",
                   "-o", out_tmpl,
                   url
